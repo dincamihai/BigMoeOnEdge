@@ -89,6 +89,11 @@ data class AppSettings(
     val mtpPMinPct: Int = 0,
     val thinking: Boolean = false,      // reasoning; off passes --no-think (enable_thinking=false)
     val metricsCsv: Boolean = true,     // write the engine's per-token CSV for this session (--csv)
+    // Embedded HTTP API (ApiServer): lets other machines on the same network (e.g. a Tailscale
+    // mesh) send prompts to the loaded session. Deliberately NOT part of sessionArgv/signature:
+    // toggling it must not tear down a warm session.
+    val apiServer: Boolean = false,
+    val apiPort: Int = DEFAULT_API_PORT,
 ) {
     /**
      * Build the argv that OPENS a persistent bmoe-cli session (`--session`): everything fixed for
@@ -213,6 +218,8 @@ data class AppSettings(
             .putString("spec", spec).putInt("mtpDraft", mtpDraft).putInt("mtpPMinPct", mtpPMinPct)
             .putBoolean("thinking", thinking)
             .putBoolean("metricsCsv", metricsCsv)
+            .putBoolean("apiServer", apiServer)
+            .putInt("apiPort", apiPort)
             .apply()
     }
 
@@ -312,6 +319,11 @@ data class AppSettings(
         val THREAD_CHOICES = intArrayOf(2, 4, 6, 8)
         val NPREDICT_CHOICES = intArrayOf(16, 32, 48, 64, 128, 256, 512, 1024, 2048)
 
+        // HTTP API port rungs rather than free text, matching how every other numeric setting is
+        // edited here. 8787 is the documented default.
+        const val DEFAULT_API_PORT = 8787
+        val API_PORT_CHOICES = intArrayOf(8787, 8080, 8888, 9090)
+
         fun load(ctx: Context): AppSettings {
             val p = ctx.prefs()
             val d = AppSettings()
@@ -355,6 +367,8 @@ data class AppSettings(
                 mtpPMinPct = p.getInt("mtpPMinPct", d.mtpPMinPct),
                 thinking = p.getBoolean("thinking", d.thinking),
                 metricsCsv = p.getBoolean("metricsCsv", d.metricsCsv),
+                apiServer = p.getBoolean("apiServer", d.apiServer),
+                apiPort = p.getInt("apiPort", d.apiPort),
             )
         }
 

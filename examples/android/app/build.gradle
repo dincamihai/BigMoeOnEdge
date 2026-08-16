@@ -122,6 +122,9 @@ android {
 
 dependencies {
     implementation 'androidx.core:core-ktx:1.13.1'
+    // Embedded HTTP API server (ApiServer.kt): com.sun.net.httpserver does not exist on Android,
+    // and NanoHTTPD is a single small jar with no transitive dependencies.
+    implementation 'org.nanohttpd:nanohttpd:2.3.1'
     implementation 'androidx.activity:activity-compose:1.9.2'
     implementation 'androidx.lifecycle:lifecycle-runtime-compose:2.8.5'
     // In-app model downloader: a foreground CoroutineWorker that survives process death and

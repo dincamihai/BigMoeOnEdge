@@ -1,6 +1,9 @@
 package io.bigmoeonedge.example
 
 import android.Manifest
+import android.app.ActivityManager
+import android.app.ApplicationExitInfo
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -276,6 +279,22 @@ private fun MainScreen(
                     }
 
                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        // Loading the model is otherwise a side effect of sending a prompt, which
+                        // makes the HTTP server unreachable until someone types into the app —
+                        // useless to a remote client, and the app is killed often enough that it
+                        // would be a chore every time. Same intent as Send, minus the prompt.
+                        if (!ui.ready && !ui.loading) {
+                            TextButton(
+                                onClick = {
+                                    if (models.isNotEmpty()) {
+                                        launchPrompt(context, models[modelIdx.coerceIn(0, models.size - 1)],
+                                            null, settings, ui.sessionSig, clearKv = true)
+                                    }
+                                },
+                                enabled = !ui.busy && models.isNotEmpty(),
+                            ) { Text("Load model") }
+                        }
+
                         // Start a new conversation: the next Send clears the KV. Keeps the model loaded.
                         TextButton(
                             onClick = { RunBus.update { it.copy(transcript = emptyList(), answer = "", summary = "", error = null) } },
@@ -357,6 +376,14 @@ private fun MainScreen(
                             CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
                             Text("Prefilling prompt…", fontSize = 14.sp)
                         }
+                    }
+
+                    // Two different deaths, each invisible in the other's account: the app process
+                    // (read once per launch, from the platform's record) and the engine child (kept
+                    // by the service across the next Load). Either one takes the HTTP server down.
+                    val lastExit = remember { lastExitReason(context) }
+                    if (lastExit != null || ui.lastEngineExit != null) {
+                        LastExitCard(listOfNotNull(lastExit, ui.lastEngineExit).joinToString("\n"))
                     }
 
                     TelemetryCard(ui, settings.threads, settings.overlap, settings.ioThreads)
@@ -522,6 +549,49 @@ private fun configFlags(s: AppSettings, modelPath: String, csv: Boolean): List<P
     return out
 }
 
+/**
+ * Why the previous app process died, straight from the platform's own record.
+ *
+ * A process kill is the one failure that erases its own evidence: [RunBus] lives in memory, so the
+ * engine's exit code, the error card and the transcript all vanish with it, and the app reopens
+ * looking freshly started — indistinguishable from a normal first launch. Android keeps this record
+ * across the death, which makes it the only honest source. Ordinary exits are not worth reporting;
+ * everything else is, because a remote API caller only ever sees a dead port.
+ */
+private fun lastExitReason(ctx: Context): String? {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
+    val am = ctx.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+    val e = runCatching { am.getHistoricalProcessExitReasons(ctx.packageName, 0, 1).firstOrNull() }
+        .getOrNull() ?: return null
+    val reason = when (e.reason) {
+        ApplicationExitInfo.REASON_LOW_MEMORY -> "LOW_MEMORY — the system reclaimed the app"
+        ApplicationExitInfo.REASON_CRASH -> "CRASH — uncaught exception"
+        ApplicationExitInfo.REASON_CRASH_NATIVE -> "CRASH_NATIVE — the engine faulted"
+        ApplicationExitInfo.REASON_ANR -> "ANR — the main thread stalled"
+        ApplicationExitInfo.REASON_SIGNALED -> "SIGNALED — killed with signal ${e.status}"
+        ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE -> "EXCESSIVE_RESOURCE_USAGE"
+        ApplicationExitInfo.REASON_DEPENDENCY_DIED -> "DEPENDENCY_DIED"
+        ApplicationExitInfo.REASON_OTHER -> "OTHER — ${e.description}"
+        // A clean stop, a reinstall or a user-issued force stop explains itself.
+        else -> return null
+    }
+    // The wall-clock time is what makes the record usable: without it a kill cannot be tied to what
+    // was happening when it landed, and every death looks like the same death.
+    val at = java.text.SimpleDateFormat("HH:mm:ss", Locale.US).format(java.util.Date(e.timestamp))
+    return "$at · $reason · rss ${e.rss / 1024} MB at exit"
+}
+
+@Composable
+private fun LastExitCard(text: String) {
+    ElevatedCard(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text("previous session ended", color = MaterialTheme.colorScheme.error,
+                fontWeight = FontWeight.Bold)
+            Text(text, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+        }
+    }
+}
+
 @Composable
 private fun TelemetryCard(ui: UiState, threads: Int, overlap: Boolean, ioThreads: Int) {
     ElevatedCard(Modifier.fillMaxWidth()) {
@@ -641,11 +711,15 @@ private fun MeterRow(label: String, value: Double, total: Double, color: android
  * ([currentSig] matches), the prompt just goes to the warm process (no reload, cache intact);
  * otherwise the session is (re)started with this configuration and the prompt runs as soon as it
  * reports ready. Per-prompt options (n_predict, thinking) ride the request, not the session.
+ *
+ * A null [prompt] loads the model and stops there — the service already treats a session intent
+ * without one as "just open the session", which is what an HTTP client needs before it can be
+ * answered.
  */
 private fun launchPrompt(
     context: android.content.Context,
     model: File,
-    prompt: String,
+    prompt: String?,
     settings: AppSettings,
     currentSig: String?,
     clearKv: Boolean,
@@ -653,6 +727,7 @@ private fun launchPrompt(
     RunBus.resetGeneration()
     val sig = settings.sessionSignature(model.absolutePath)
     if (currentSig == sig) {
+        if (prompt == null) return // this session is already what a bare load would have produced
         context.startService(
             Intent(context, RunService::class.java)
                 .setAction(RunService.ACTION_GENERATE)
@@ -674,10 +749,10 @@ private fun launchPrompt(
                 .putExtra(RunService.EXTRA_MODEL, model.absolutePath)
                 .putStringArrayListExtra(RunService.EXTRA_ARGV, argv)
                 .putExtra(RunService.EXTRA_SIG, sig)
-                .putExtra(RunService.EXTRA_PROMPT, prompt)
                 .putExtra(RunService.EXTRA_NPREDICT, settings.nPredict)
                 .putExtra(RunService.EXTRA_THINK, settings.thinking)
                 .putExtra(RunService.EXTRA_CLEAR_KV, true)
+                .apply { if (prompt != null) putExtra(RunService.EXTRA_PROMPT, prompt) }
         )
     }
 }

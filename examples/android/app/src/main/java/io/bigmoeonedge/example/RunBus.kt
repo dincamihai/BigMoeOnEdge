@@ -39,6 +39,10 @@ data class UiState(
     // 0 = not MoE. Settings needs it because "Drop cold experts" is a fraction of 1/top-k, so the
     // same percentage means something very different on a narrow routing.
     val nExpertUsed: Int? = null,
+    // How the previous engine process ended, when it ended badly. Deliberately outside everything
+    // [resetGeneration] clears: the natural next thing a user does after a session dies is start
+    // another one, which would otherwise wipe the only account of the death before it is read.
+    val lastEngineExit: String? = null,
     val transcript: List<ChatTurn> = emptyList(), // committed turns; the in-flight answer is `answer`
     val streaming: Boolean = true,  // is the loaded session using the MoE streamer (vs mmap baseline)?
 ) {

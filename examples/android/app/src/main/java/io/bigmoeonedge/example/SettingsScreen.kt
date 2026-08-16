@@ -283,6 +283,27 @@ fun SettingsScreen(current: AppSettings, onChange: (AppSettings) -> Unit, onBack
                     current.metricsCsv,
                 ) { onChange(current.copy(metricsCsv = it)) }
             }
+
+            Section("Remote API") {
+                SwitchRow(
+                    "HTTP API server",
+                    "Serve the loaded model over HTTP (POST /generate, or /v1/chat/completions for " +
+                        "an OpenAI client — including one on this phone at 127.0.0.1, with no network " +
+                        "at all). No authentication: anyone who can reach the port can generate. " +
+                        "While this is on, an idle session is never unloaded, so the model keeps its " +
+                        "RAM until you close it. Takes effect on the next session.",
+                    current.apiServer,
+                ) { onChange(current.copy(apiServer = it)) }
+                IntSetting(
+                    "API port", AppSettings.API_PORT_CHOICES, current.apiPort,
+                    enabled = current.apiServer,
+                ) { onChange(current.copy(apiPort = it)) }
+                Hint(
+                    "A remote generation shares the one loaded session: it queues behind whatever " +
+                        "is running, and by default starts a fresh context — which also resets the " +
+                        "chat conversation here."
+                )
+            }
         }
     }
 }

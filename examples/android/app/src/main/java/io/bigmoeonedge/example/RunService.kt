@@ -19,6 +19,7 @@ import java.io.BufferedWriter
 import java.io.File
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
@@ -65,6 +66,88 @@ class RunService : Service() {
 
     private data class Req(val prompt: String, val nPredict: Int, val think: Boolean, val clearKv: Boolean)
 
+    // ── embedded HTTP API (ApiServer) ──
+    // Requests that arrived over HTTP rather than from the chat UI. Keyed by the same id space
+    // sendGenerate uses, so handleLine can route each BMOE_* result to exactly one consumer:
+    // an id found here resolves its callback and never touches RunBus — the chat UI does not see
+    // API traffic. The engine's session loop runs one generation at a time, so at most one API id
+    // is active; the field mirrors it so the per-token progress lines (which carry no id) know
+    // whether they belong to the UI or to an API caller.
+    data class ApiResult(val text: String, val reasoning: String, val tokens: Int,
+                         val tokS: Double, val cancelled: Boolean)
+    private val apiCallbacks = ConcurrentHashMap<Int, (Result<ApiResult>) -> Unit>()
+    // Optional per-token sink for a streaming caller, alongside the once-at-the-end callback above.
+    // The engine's progress lines carry the whole text so far, not a delta, so [apiEmitted] records
+    // how much of it has already gone out.
+    private val apiDeltas = ConcurrentHashMap<Int, (String) -> Unit>()
+    @Volatile private var apiEmitted = 0
+    @Volatile private var activeApiId: Int? = null
+    private var api: ApiServer? = null
+
+    /** Why the API server is not up, when the setting asked for it. Shown in the notification. */
+    private var apiError: String? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        syncApiServer()
+    }
+
+    /**
+     * Bring the HTTP server in line with the current setting: start it, stop it, or move it to a
+     * new port. Idempotent, so it can be called on every session start. A bind failure is not
+     * silent — [apiError] carries it to the notification, because a server that never came up looks
+     * exactly like a server that is up but unreachable, and only one of those is the user's to fix.
+     */
+    private fun syncApiServer() {
+        val s = AppSettings.load(this)
+        val want = if (s.apiServer) s.apiPort else null
+        if (want == api?.listeningPort) return
+        api?.stop()
+        api = null
+        apiError = null
+        if (want == null) return
+        val server = ApiServer(want, this)
+        runCatching { server.start(fi.iki.elonen.NanoHTTPD.SOCKET_READ_TIMEOUT, false) }
+            .onSuccess { api = server }
+            .onFailure { apiError = it.message ?: "bind failed" } // port taken: the app still works
+    }
+
+    /**
+     * Send one generation on behalf of an HTTP caller. Returns the request id, or -1 when no
+     * session process is accepting input (the caller answers 503). The write is the same
+     * `{"cmd":"generate",...}` line the UI path sends; only the result routing differs.
+     */
+    fun generateForApi(prompt: String, nPredict: Int, think: Boolean, clearKv: Boolean,
+                       onDelta: ((String) -> Unit)? = null,
+                       cb: (Result<ApiResult>) -> Unit): Int {
+        val id = synchronized(writeLock) { nextId++ }
+        apiCallbacks[id] = cb
+        if (onDelta != null) apiDeltas[id] = onDelta
+        if (!send(generateJson(id, Req(prompt, nPredict, think, clearKv)))) {
+            apiCallbacks.remove(id)
+            apiDeltas.remove(id)
+            return -1
+        }
+        return id
+    }
+
+    /** Forget a timed-out API request so a late BMOE_DONE cannot resolve into a dead HTTP thread. */
+    fun abandonApi(id: Int) {
+        apiCallbacks.remove(id)
+        apiDeltas.remove(id)
+        if (activeApiId == id) activeApiId = null
+    }
+
+    /** The session is going away: every waiting API caller gets an error now, not a timeout later. */
+    private fun failAllApi(reason: String) {
+        activeApiId = null
+        val waiting = apiCallbacks.keys.toList()
+        waiting.forEach { id ->
+            apiDeltas.remove(id)
+            apiCallbacks.remove(id)?.invoke(Result.failure(IllegalStateException(reason)))
+        }
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -83,6 +166,11 @@ class RunService : Service() {
     private var sessionCtx = AppSettings.SESSION_CTX
 
     private fun startSession(intent: Intent?) {
+        // The API toggle is read here, not only in onCreate: a shutdown leaves this Service alive
+        // (it kills the engine process, never itself), so onCreate does NOT run again when the user
+        // reopens a session — and a toggle flipped in between would never take effect, which is
+        // exactly what "takes effect on the next session" promises.
+        syncApiServer()
         val model = intent?.getStringExtra(EXTRA_MODEL) ?: run { fail("no model"); return }
         val argv = intent.getStringArrayListExtra(EXTRA_ARGV) ?: run { fail("no argv"); return }
         val sig = intent.getStringExtra(EXTRA_SIG)
@@ -177,9 +265,14 @@ class RunService : Service() {
 
             val code = p.waitFor()
             if (current(myEpoch) && code != 0) {
+                // A negative code is the JVM's rendering of death by signal (-N == SIGN), which is
+                // what an outside killer looks like from here; a positive one is the engine's own
+                // exit status. The distinction decides whether to look at Android or at us.
+                val how = if (code < 0) "killed by signal ${-code}" else "exited $code"
                 RunBus.update {
                     it.copy(state = EngineState.ERROR,
-                        error = if (it.error == null) "bmoe-cli exited $code\n${errTail.takeLast(1200)}" else it.error)
+                        lastEngineExit = "bmoe-cli $how\n${errTail.takeLast(600)}".trimEnd(),
+                        error = if (it.error == null) "bmoe-cli $how\n${errTail.takeLast(1200)}" else it.error)
                 }
             }
         } catch (t: Throwable) {
@@ -189,6 +282,7 @@ class RunService : Service() {
             // touch the shared process handles, the UI state, or the foreground service — the new
             // session owns them now.
             if (epoch == myEpoch) {
+                failAllApi("session closed")
                 releaseWake()
                 procWriter = null
                 proc = null
@@ -217,21 +311,94 @@ class RunService : Service() {
                 telemetry.reset()
                 acquireWake()
                 main.removeCallbacks(idleUnload)
-                RunBus.update {
-                    it.copy(state = EngineState.GENERATING, telemetry = telemetry.current.copy(),
-                        answer = "", reasoning = "", summary = "", error = null)
+                val id = lineId(t)
+                if (id != null && apiCallbacks.containsKey(id)) {
+                    // API generation: same wake/idle bookkeeping as a UI turn, none of the UI state.
+                    // The per-token progress lines carry no id, so this flag is what keeps them out
+                    // of RunBus until the matching BMOE_DONE clears it.
+                    activeApiId = id
+                    apiEmitted = 0
+                } else {
+                    RunBus.update {
+                        it.copy(state = EngineState.GENERATING, telemetry = telemetry.current.copy(),
+                            answer = "", reasoning = "", summary = "", error = null)
+                    }
+                    main.post { notify("Generating…") }
                 }
-                main.post { notify("Generating…") }
             }
-            telemetry.onLine(t) -> {
+            telemetry.onLine(t) -> if (activeApiId == null) {
                 sampleCpuTemp()
                 RunBus.update {
                     it.copy(telemetry = telemetry.current.copy(), answer = telemetry.current.text,
                         reasoning = telemetry.current.reasoning)
                 }
+            } else {
+                pushDelta(activeApiId, telemetry.current.text)
             }
-            t.startsWith("BMOE_DONE ") -> onDone(t.removePrefix("BMOE_DONE "))
-            t.startsWith("BMOE_ERROR ") -> onError(t.removePrefix("BMOE_ERROR "))
+            t.startsWith("BMOE_DONE ") -> {
+                val json = t.removePrefix("BMOE_DONE ")
+                val id = lineId(json)
+                if (id != null && apiCallbacks.containsKey(id)) onApiDone(id, json) else onDone(json)
+            }
+            t.startsWith("BMOE_ERROR ") -> {
+                val json = t.removePrefix("BMOE_ERROR ")
+                val id = lineId(json)
+                if (id != null && apiCallbacks.containsKey(id)) onApiError(id, json) else onError(json)
+            }
+        }
+    }
+
+    /** The request id carried on a BMOE_* line (or in its JSON payload), if any. */
+    private fun lineId(s: String): Int? =
+        Regex(""""id"\s*:\s*(\d+)""").find(s)?.groupValues?.get(1)?.toIntOrNull()
+
+    /**
+     * Hand a streaming caller everything of [full] it has not seen yet. The engine reports the text
+     * accumulated so far on every progress line, so the delta is whatever grew since last time; a
+     * line that adds nothing (a pure telemetry tick) sends nothing. A sink that throws — a client
+     * that hung up mid-answer — must not take the reader thread down with it.
+     */
+    private fun pushDelta(id: Int?, full: String) {
+        val sink = apiDeltas[id ?: return] ?: return
+        if (full.length <= apiEmitted) return
+        val delta = full.substring(apiEmitted)
+        apiEmitted = full.length
+        runCatching { sink(delta) }
+    }
+
+    private fun onApiDone(id: Int, json: String) {
+        val result = runCatching {
+            val o = JSONObject(json)
+            ApiResult(o.optString("text"), o.optString("reasoning"), o.optInt("tokens"),
+                o.optDouble("tok_s"), o.optBoolean("cancelled"))
+        }
+        // The summary is authoritative: flush any tail the progress lines had not reported before
+        // the stream is closed, so a streamed answer equals the non-streamed one.
+        result.getOrNull()?.let { pushDelta(id, it.text) }
+        apiDeltas.remove(id)
+        val cb = apiCallbacks.remove(id)
+        activeApiId = null
+        cb?.invoke(result)
+        releaseWake()
+        main.post { notify("Model ready") }
+        scheduleIdleUnload()
+    }
+
+    private fun onApiError(id: Int, json: String) {
+        val fatal = runCatching { JSONObject(json).optBoolean("fatal", true) }.getOrDefault(true)
+        val msg = runCatching { JSONObject(json).optString("msg") }.getOrDefault("engine error")
+        apiDeltas.remove(id)
+        apiCallbacks.remove(id)?.invoke(Result.failure(IllegalStateException(msg)))
+        activeApiId = null
+        releaseWake()
+        if (fatal) {
+            // The session is dying; the UI learns it exactly as before, and every other waiting
+            // API caller fails now rather than timing out one by one.
+            RunBus.update { it.copy(state = EngineState.ERROR, error = msg) }
+            failAllApi("session closed: $msg")
+            shutdownSession()
+        } else {
+            scheduleIdleUnload()
         }
     }
 
@@ -437,20 +604,22 @@ class RunService : Service() {
     )
 
     private fun sendGenerate(req: Req) {
-        val id = nextId++
+        // Ids are shared with the HTTP path, which allocates from other threads — same lock.
+        val id = synchronized(writeLock) { nextId++ }
         // Show the user's turn immediately. clear_kv = "new chat" resets the transcript to this turn.
         RunBus.update {
             val user = ChatTurn("user", req.prompt)
             it.copy(transcript = if (req.clearKv) listOf(user) else it.transcript + user, answer = "")
         }
-        val json = buildString {
-            append("""{"cmd":"generate","id":""").append(id)
-            append(""","n_predict":""").append(req.nPredict)
-            append(""","think":""").append(req.think)
-            append(""","clear_kv":""").append(req.clearKv)
-            append(""","prompt":"""").append(jsonEscape(req.prompt)).append("\"}")
-        }
-        if (!send(json)) fail("session not ready")
+        if (!send(generateJson(id, req))) fail("session not ready")
+    }
+
+    private fun generateJson(id: Int, req: Req): String = buildString {
+        append("""{"cmd":"generate","id":""").append(id)
+        append(""","n_predict":""").append(req.nPredict)
+        append(""","think":""").append(req.think)
+        append(""","clear_kv":""").append(req.clearKv)
+        append(""","prompt":"""").append(jsonEscape(req.prompt)).append("\"}")
     }
 
     private fun send(json: String): Boolean = synchronized(writeLock) {
@@ -525,6 +694,11 @@ class RunService : Service() {
 
     private fun scheduleIdleUnload() {
         main.removeCallbacks(idleUnload)
+        // With the HTTP API on, the session IS what a remote client depends on: unloading it after
+        // an idle window takes the server down with it, and the client — which has no way to ask
+        // for a reload — just finds a dead port. The toggle is opt-in, so holding model-sized RAM
+        // is what the user asked for; the app-only path keeps the timer.
+        if (api != null) return
         main.postDelayed(idleUnload, IDLE_UNLOAD_MS)
     }
 
@@ -554,6 +728,9 @@ class RunService : Service() {
 
     override fun onDestroy() {
         shuttingDown = true
+        failAllApi("service destroyed")
+        api?.stop()
+        api = null
         main.removeCallbacks(idleUnload)
         main.removeCallbacks(forceKill)
         killProcess()
@@ -568,9 +745,13 @@ class RunService : Service() {
                 NotificationChannel(CHANNEL, "Generation", NotificationManager.IMPORTANCE_LOW)
             )
         }
+        // Surface the API endpoint in the persistent notification: it is the one place that says
+        // "this phone is serving" without opening the app.
+        val apiSuffix = api?.let { " · API :${it.listeningPort}" }
+            ?: apiError?.let { " · API failed: $it" } ?: ""
         return Notification.Builder(this, CHANNEL)
             .setContentTitle("BigMoeOnEdge")
-            .setContentText(text)
+            .setContentText(text + apiSuffix)
             .setSmallIcon(android.R.drawable.stat_sys_download)
             .setOngoing(true)
             .build()
