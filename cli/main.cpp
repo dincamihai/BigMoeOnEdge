@@ -388,10 +388,19 @@ static void print_usage(const char * argv0) {
         "\n"
         "  Sampling (default: greedy/argmax, deterministic):\n"
         "      --temp F            sampling temperature; <= 0 keeps greedy (default 0). > 0 enables\n"
-        "                          the chain top-k -> top-p -> temp -> dist\n"
+        "                          the chain dry -> top-k -> top-p -> temp -> dist\n"
         "      --top-k N           top-k cutoff when sampling (0 disables the stage; default 40)\n"
         "      --top-p F           nucleus cutoff in (0,1] when sampling (default 0.95)\n"
         "      --seed N            RNG seed for sampling (default: random per run)\n"
+        "      --dry-multiplier F  DRY penalty on repeating a sequence already in the context\n"
+        "                          (0 disables, the default; 0.8 is upstream's suggested strength).\n"
+        "                          Needs --temp > 0. Cures a chat that reopens every reply with the\n"
+        "                          same memorised phrase, which top-k/top-p cannot\n"
+        "      --dry-allowed-length N  how long a repeat may grow before DRY charges for it\n"
+        "                          (default 2). Lower it to 0 or 1 when a phrase keeps coming back\n"
+        "                          even at a large multiplier: its opening tokens were free\n"
+        "      --dry-base F        growth of the penalty per extra repeated token, >= 1\n"
+        "                          (default 1.75): multiplier * base^(match_len - allowed_len)\n"
         "\n"
         "  Self-speculative decoding (draft a continuation, verify it in one wider decode).\n"
         "  Greedy verification makes the output token-identical to plain decode; the win is reading\n"
@@ -574,6 +583,12 @@ int main(int argc, char ** argv) {
             cfg.sampling.top_p = (float) std::atof(next("--top-p"));
         else if (a == "--seed")
             cfg.sampling.seed = (uint32_t) std::strtoul(next("--seed"), nullptr, 10);
+        else if (a == "--dry-multiplier")
+            cfg.sampling.dry_multiplier = (float) std::atof(next("--dry-multiplier"));
+        else if (a == "--dry-allowed-length")
+            cfg.sampling.dry_allowed_length = std::atoi(next("--dry-allowed-length"));
+        else if (a == "--dry-base")
+            cfg.sampling.dry_base = (float) std::atof(next("--dry-base"));
         else if (a == "--mtp" || a == "--ngram") {
             // Two sources for one loop, so asking for both is a contradiction rather than a
             // precedence question — say so instead of silently honouring the last flag.

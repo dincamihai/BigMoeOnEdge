@@ -544,6 +544,17 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
                   "SamplingConfig::seed default must mirror LLAMA_DEFAULT_SEED");
     if (cfg.sampling.temp > 0.0f) {
         im.smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+        // DRY sees the whole distribution, so it goes ahead of the narrowing stages — the order
+        // llama.cpp's own common sampler uses. Its remaining knobs stay at upstream's defaults;
+        // the multiplier alone decides whether the stage exists at all.
+        if (cfg.sampling.dry_multiplier > 0.0f) {
+            static const char * kDrySeqBreakers[] = {"\n", ":", "\"", "*"};
+            llama_sampler_chain_add(
+                im.smpl, llama_sampler_init_dry(llama_model_get_vocab(model), llama_model_n_ctx_train(model),
+                                                cfg.sampling.dry_multiplier, cfg.sampling.dry_base,
+                                                cfg.sampling.dry_allowed_length, /*dry_penalty_last_n*/ -1,
+                                                kDrySeqBreakers, sizeof(kDrySeqBreakers) / sizeof(kDrySeqBreakers[0])));
+        }
         llama_sampler_chain_add(im.smpl, llama_sampler_init_top_k(cfg.sampling.top_k));
         llama_sampler_chain_add(im.smpl, llama_sampler_init_top_p(cfg.sampling.top_p, /*min_keep*/ 1));
         llama_sampler_chain_add(im.smpl, llama_sampler_init_temp(cfg.sampling.temp));
@@ -759,6 +770,7 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
         ri.top_k = cfg.sampling.top_k;
         ri.top_p = cfg.sampling.top_p;
         ri.seed = cfg.sampling.seed;
+        ri.dry_multiplier = cfg.sampling.dry_multiplier;
         ri.moe_stream = cfg.moe.enabled;
         ri.cache_auto = cfg.moe.cache_auto;
         ri.cache_floor_mb = cfg.moe.cache_floor_mb;
@@ -1098,6 +1110,16 @@ RunResult Session::generate(const GenerateRequest & req,
     if (chat_on)
         for (int i = (int) n_common; i < n_prompt; ++i)
             im.kv_tokens.push_back(tokens[i]);
+    // A penalty stage (DRY today) decides from what the context already contains, and the only
+    // tokens it ever sees are the ones accepted here plus the ones it samples itself. Leave the
+    // prompt out and the stage is blind to it: a chat whose history repeats a phrase every turn
+    // keeps repeating it, because each reply looks like the first occurrence. Only the freshly
+    // decoded suffix, mirroring kv_tokens — the shared prefix was accepted on an earlier turn.
+    // A turn that rewinds the KV cannot un-accept, so the stage keeps a little stale history;
+    // harmless, since its window ages out and the rewound text really was generated.
+    if (im.smpl)
+        for (int i = (int) n_common; i < n_prompt; ++i)
+            llama_sampler_accept(im.smpl, tokens[i]);
     // Announced only once the prompt is in both contexts: begin() checks how far the draft context
     // has actually got, so calling it before prefill would warn about a gap that is about to close.
     if (mtp_on) common_speculative_begin(im.mtp.get(), /*seq_id*/ 0, tokens);

@@ -16,13 +16,23 @@ namespace bmoe {
 
 // Token sampling. temp <= 0 (the default) selects greedy argmax — the deterministic path the
 // byte-identity gates depend on, and today's behaviour for any caller that sets nothing. temp > 0
-// builds the standard chain top_k -> top_p -> temp -> dist. Opt-in by construction: sampling never
-// perturbs a run that did not ask for it, so the gates stay meaningful.
+// builds the standard chain dry -> top_k -> top_p -> temp -> dist. Opt-in by construction: sampling
+// never perturbs a run that did not ask for it, so the gates stay meaningful.
 struct SamplingConfig {
     float temp = 0.0f;           // <= 0: greedy (argmax). > 0: stochastic sampling.
     int top_k = 40;              // 0 disables the top-k stage (llama.cpp convention)
     float top_p = 0.95f;         // nucleus cutoff, in (0, 1]
     uint32_t seed = 0xFFFFFFFFu; // == LLAMA_DEFAULT_SEED (random per run); static_assert'd in session.cpp
+    // DRY penalises continuing a token sequence that already occurred in the context. Narrowing
+    // stages cannot do this: a memorised opening is the single most probable continuation at every
+    // step, so it survives top_k and top_p and a multi-turn chat repeats it verbatim. 0 disables.
+    float dry_multiplier = 0.0f;
+    // How long a repeat may grow before it is penalised at all, and how fast the penalty then
+    // grows: multiplier * base^(match_length - allowed_length). Upstream's defaults let a repeat
+    // start for free, which is exactly where a memorised opening escapes — lower allowed_length
+    // when a phrase keeps coming back despite a large multiplier.
+    int dry_allowed_length = 2;
+    float dry_base = 1.75f;
 };
 
 // How the dense (non-expert) model weights are kept resident. See MoeStreamConfig::dense_weights and

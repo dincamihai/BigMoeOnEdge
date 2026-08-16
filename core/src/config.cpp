@@ -50,6 +50,18 @@ ValidationResult validate(const RunConfig & cfg) {
         if (cfg.sampling.top_p <= 0.0f || cfg.sampling.top_p > 1.0f) {
             return fail("sampling.top_p must be in (0, 1]");
         }
+        if (cfg.sampling.dry_multiplier < 0.0f) {
+            return fail("sampling.dry_multiplier must be >= 0 (0 disables the DRY stage)");
+        }
+        if (cfg.sampling.dry_multiplier > 0.0f) {
+            if (cfg.sampling.dry_allowed_length < 0) {
+                return fail("sampling.dry_allowed_length must be >= 0");
+            }
+            // Below 1 the exponential runs backwards and a longer repeat is penalised less.
+            if (cfg.sampling.dry_base < 1.0f) {
+                return fail("sampling.dry_base must be >= 1");
+            }
+        }
     }
 
     // Verification is exact only because greedy acceptance compares argmax against argmax. Under a

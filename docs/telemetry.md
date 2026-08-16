@@ -220,8 +220,8 @@ prints just the summary lines.
   force_cache=<0|1> load_all=<0|1> io_threads=<n> o_direct=<0|1> overlap=<0|1> io_two_wave=<0|1> prefetch=<n>
   route_ahead=<n> predict_prefetch=<0|1> predict_log=<0|1> predict_spec_max=<n> prefetch_sync=<0|1>
   dense_weights=<mmap|warm|anon|ahwb> drop_cold_frac=<f> drop_renorm=<0|1> drop_prefill=<0|1>
-# temp=<f> top_k=<n> top_p=<f> seed=<u> compute_trace_layers=<n> spec=<off|mtp|ngram>
-  spec_draft_max=<n> mtp_p_min=<f> ngram_min_match=<n>
+# temp=<f> top_k=<n> top_p=<f> seed=<u> dry_multiplier=<f> compute_trace_layers=<n>
+  spec=<off|mtp|ngram> spec_draft_max=<n> mtp_p_min=<f> ngram_min_match=<n>
 ```
 
 Rows without this are not evidence: two files answer "which is faster" only if something says what

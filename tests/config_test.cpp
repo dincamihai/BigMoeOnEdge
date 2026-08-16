@@ -182,6 +182,36 @@ int main() {
         expect_fail("top_k must be >= 0 when sampling", c);
     }
     {
+        RunConfig c = ok_base();
+        c.sampling.temp = 0.8f;
+        c.sampling.dry_multiplier = 0.8f;
+        expect_ok("DRY multiplier accepted when sampling", c);
+        c.sampling.dry_multiplier = -0.1f;
+        expect_fail("dry_multiplier must be >= 0 when sampling", c);
+    }
+    {
+        // The shape knobs are checked only once DRY is actually on, the same opt-in rule the whole
+        // sampling block follows.
+        RunConfig c = ok_base();
+        c.sampling.temp = 0.8f;
+        c.sampling.dry_base = 0.5f;
+        c.sampling.dry_allowed_length = -1;
+        expect_ok("DRY shape unchecked while the stage is off", c);
+        c.sampling.dry_multiplier = 0.8f;
+        expect_fail("dry_allowed_length must be >= 0 when DRY is on", c);
+        c.sampling.dry_allowed_length = 0;
+        expect_fail("dry_base must be >= 1 when DRY is on", c);
+        c.sampling.dry_base = 1.75f;
+        expect_ok("valid DRY config", c);
+    }
+    {
+        // Inert under greedy, like every other sampling knob: the stage is never built, so a value
+        // the sampling path would reject still describes a valid deterministic run.
+        RunConfig c = ok_base();
+        c.sampling.dry_multiplier = -1.0f;
+        expect_ok("dry_multiplier unchecked while greedy", c);
+    }
+    {
         // With greedy (temp <= 0) the other knobs are inert, so out-of-range values are still a
         // valid greedy run — the default path must never be rejected on account of sampling fields.
         RunConfig c = ok_base();

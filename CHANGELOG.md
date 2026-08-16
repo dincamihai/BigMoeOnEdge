@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
+## [Unreleased]
+
+### Added
+- **DRY sampling, and the prompt is finally visible to the sampler.** A multi-turn chat would
+  reopen every reply with the same memorised phrase, and no amount of `--temp` fixed it: the
+  narrowing stages keep whichever token is most probable, and after a few identical openings in the
+  history that token is the first word of the formula. `--dry-multiplier` adds llama.cpp's DRY
+  stage ahead of top-k, penalising a continuation that would extend a sequence already in the
+  context; `--dry-allowed-length` and `--dry-base` shape how soon and how steeply it charges.
+  Default 0, so greedy runs and the byte-identity gates are untouched. The stage alone was not
+  enough: penalty samplers judge from the tokens they have been handed, and the engine had never
+  handed them the prompt — only self-sampled tokens, so every reply looked like the phrase's first
+  occurrence. Prompt tokens are now accepted into the chain after prefill, which is what makes DRY
+  (and any future penalty stage) see the conversation instead of just its own output.
+  `dry_multiplier` joins the CSV run header.
+
 ## [0.19.0] - 2026-08-01
 
 ### Added

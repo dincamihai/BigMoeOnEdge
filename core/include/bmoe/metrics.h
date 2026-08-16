@@ -287,6 +287,7 @@ struct RunInfo {
     int top_k = 40;
     float top_p = 0.95f;
     uint32_t seed = 0xFFFFFFFFu;
+    float dry_multiplier = 0.0f; // 0 = the DRY stage was absent from the chain
 
     // Self-speculation, and which source drafted ("off", "mtp", "ngram"). It changes how many tokens
     // a decode confirms, so every per-token row in the file was produced under a different

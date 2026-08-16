@@ -44,10 +44,10 @@ public:
                      r.predict_prefetch, r.predict_log, r.predict_spec_max, r.prefetch_sync, r.dense_weights.c_str(),
                      (double) r.drop_cold_frac, r.drop_renorm, r.drop_prefill);
         std::fprintf(f_,
-                     "# temp=%.4g top_k=%d top_p=%.4g seed=%u compute_trace_layers=%d spec=%s "
+                     "# temp=%.4g top_k=%d top_p=%.4g seed=%u dry_multiplier=%.4g compute_trace_layers=%d spec=%s "
                      "spec_draft_max=%d mtp_p_min=%.4g ngram_min_match=%d\n",
-                     (double) r.temp, r.top_k, (double) r.top_p, r.seed, r.compute_trace_layers, r.spec.c_str(),
-                     r.spec_draft_max, (double) r.mtp_p_min, r.ngram_min_match);
+                     (double) r.temp, r.top_k, (double) r.top_p, r.seed, (double) r.dry_multiplier,
+                     r.compute_trace_layers, r.spec.c_str(), r.spec_draft_max, (double) r.mtp_p_min, r.ngram_min_match);
         write_header();
     }
 
