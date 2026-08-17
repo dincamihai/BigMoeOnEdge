@@ -425,7 +425,8 @@ extends to them naturally.
 Requests (stdin):
 
 ```
-{"cmd":"generate","id":<int>,"prompt":"<string>","n_predict":<int>,"think":<bool>,"clear_kv":<bool>}
+{"cmd":"generate","id":<int>,"prompt":"<string>","n_predict":<int>,"think":<bool>,"clear_kv":<bool>,
+ "messages":[<OpenAI messages>],"tools":[<OpenAI tools>]}
 {"cmd":"cancel"}          # interrupt the in-flight generation; the session stays loaded
 {"cmd":"close"}           # end the session (EOF on stdin does the same)
 ```
@@ -436,11 +437,22 @@ the engine-held conversation); `clear_kv:false` **continues** the conversation â
 user message, the engine re-renders the whole history and reuses the KV prefix (see
 [session.md](session.md)). `cancel` may arrive at any time, including mid-generation.
 
+`messages` and `tools` are optional and carry the OpenAI shapes verbatim â€” the engine parses both
+with llama.cpp's own converters, so whatever llama-server accepts is accepted here. `messages`
+**replaces** the engine-held conversation for that turn and `prompt` is then ignored: an HTTP API
+serving several clients cannot use a running history, because each request arrives with its own.
+A REPL that wants the engine to keep the conversation sends `prompt` and leaves `messages` out.
+`tools` are rendered by the model's own chat template, in whatever syntax its family uses; a
+template that does not describe tools ignores them, which is what `BMOE_READY`'s `tools` reports
+in advance. A malformed `messages`/`tools` is answered with `BMOE_ERROR`, not with a silent
+fallback: a caller who sent a conversation has no raw prompt to fall back to.
+
 Responses (stdout):
 
 ```
 BMOE_READY {"load_s":<float>,"arch":"<string>","n_ctx":<int>,
-            "think_ctl":"template|prefill|none","n_expert_used":<int>}  # once, after the model loads
+            "think_ctl":"template|prefill|none","n_expert_used":<int>,
+            "tools":<bool>}                                            # once, after the model loads
 BMOE_BEGIN {"id":<int>}                                                # a generation started
 BMOE_LOAD / BMOE_PROGRESS ...                                          # per token, as above
 BMOE_DONE  {"id":<int>,"cancelled":<bool>,"tokens":<int>,"tok_s":<float>,
@@ -450,7 +462,7 @@ BMOE_DONE  {"id":<int>,"cancelled":<bool>,"tokens":<int>,"tok_s":<float>,
             "stall_s_tok":<float>,"mgmt_s_tok":<float>,"majflt_tok":<float>,"cpu_s_tok":<float>,
             "token_demand_mib":<float>,"mtp_drafted":<int>,"mtp_accepted":<int>,"mtp_decodes":<int>,
             "mtp_draft_s_tok":<float>,"drafted_steps":<int>,"loop_overhead_s_tok":<float>,
-            "reasoning":"<string>","text":"<string>"}
+            "reasoning":"<string>","tool_calls":[<OpenAI tool calls>],"text":"<string>"}
 BMOE_ERROR {"id":<int>,"fatal":<bool>,"msg":"<string>"}
 ```
 
@@ -462,6 +474,16 @@ excludes both, so `1 / (1/tok_s + loop_overhead_s_tok)` is the rate a user actua
 `drafted_steps` is how many passes drafted at all: it equals `mtp_decodes` for the head and is lower
 for `--ngram`, which decodes plainly when it has no match. See [mtp.md](mtp.md) and
 [ngram.md](ngram.md).
+
+`BMOE_DONE`'s `tool_calls` is what the model asked to call, in the OpenAI shape, or `[]`. A turn
+that ends in tool calls normally has an empty `text`, so a caller reads this before concluding the
+model produced nothing.
+
+`BMOE_READY`'s `tools` states whether the loaded model's chat template describes tools at all. It
+is read from the template's own capabilities, and exists for the reason `think_ctl` does: a
+template that ignores `tools` renders a prompt identical to one sent without them, so the model
+answers normally and a caller waits for a call that can never arrive. `false` means a tool-using
+feature should be disabled rather than attempted.
 
 `BMOE_READY`'s `n_expert_used` is the **effective** routing width, after any `--n-expert-used`
 override (`0` on a non-MoE model). A UI needs it to say anything sensible about

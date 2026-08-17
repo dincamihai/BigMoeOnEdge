@@ -83,6 +83,21 @@ const char * think_control_name(ThinkControl c);
 // expert cache stays warm; clear_kv=false continues the KV cache for multi-turn chat.
 struct GenerateRequest {
     std::string prompt;
+    // The whole conversation as an OpenAI-shaped JSON array, for callers that own the history
+    // themselves — an HTTP API serving many clients cannot use the engine's running conversation,
+    // because each request arrives with its own. When set it REPLACES the engine-held history for
+    // this turn; `prompt` is then ignored. Empty (the default) keeps the append-one-user-turn
+    // behaviour that a REPL wants.
+    //
+    // JSON, not a vector of message structs, because this header is a port: `core/include/bmoe`
+    // names no llama.cpp type, and a message struct here would either duplicate
+    // `common_chat_msg` or leak it. The engine parses it with llama.cpp's own OpenAI converter,
+    // so the shape this accepts is by construction the shape llama-server accepts.
+    std::string messages_json;
+    // Tools the model may call, as an OpenAI-shaped JSON array. The model's own chat template
+    // renders them — nothing here knows any model's tool syntax, exactly as nothing here knows
+    // any model's reasoning markers. Empty means the turn is a plain completion.
+    std::string tools_json;
     int n_predict = 32;
     bool think = true;
     bool clear_kv = true;
@@ -142,6 +157,12 @@ public:
     // rather than leaving a Thinking toggle that silently does nothing. Always Template when chat
     // mode is off, where no template is rendered and the question does not arise.
     ThinkControl think_control() const;
+
+    // Whether this model's chat template describes tools at all. Read from the template's own
+    // capabilities at open(), for the reason think_control() exists: a template that ignores
+    // `tools` renders the identical prompt with and without them, so the model answers normally
+    // and a caller waits for a tool call that can never arrive. False when chat mode is off.
+    bool supports_tools() const;
 
     // Set the expert-cache budget in MiB and evict down to it now. PRECONDITION: no generate() in
     // flight — call it between generations (e.g. from an app's memory-pressure callback). A no-op

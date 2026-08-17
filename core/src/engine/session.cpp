@@ -18,9 +18,12 @@
 // reasoning parsing. See the note in the root CMakeLists / docs/seam.md.
 #include "chat.h"
 #include "common.h"
+// chat.h forward-declares the json type; the OpenAI converters are used here with real values.
+#include "nlohmann/json.hpp"
 #include "speculative.h"
 
 #include <algorithm>
+#include <map>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -282,6 +285,7 @@ struct Session::Impl {
     // How a think=false request can be honoured on this model; probed once at open(). Template
     // (the fail-open default) means the flag alone does the job and generate() adds nothing.
     ThinkControl think_ctl = ThinkControl::Template;
+    bool tools_ok = false;
     bool backend_inited = false;
 
     // Sampling chain, built once at open() only when sampling is requested (temp > 0); null on the
@@ -354,6 +358,10 @@ int Session::n_expert_used() const {
 }
 ThinkControl Session::think_control() const {
     return impl_->think_ctl;
+}
+
+bool Session::supports_tools() const {
+    return impl_->tools_ok;
 }
 void Session::set_cache_budget_mb(int mib) {
     impl_->source.set_cache_budget((size_t) std::max(0, mib) * 1024ull * 1024ull);
@@ -470,6 +478,10 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
             // Which "thinking off" mechanism this template supports is a property of the model, so
             // it is settled once here rather than re-derived on every turn.
             im.think_ctl = detail::probe_think_control(im.chat_tmpls.get());
+            // The template states this itself, so unlike the thinking question it needs no probe.
+            const std::map<std::string, bool> caps = common_chat_templates_get_caps(im.chat_tmpls.get());
+            const auto it = caps.find("supports_tools");
+            im.tools_ok = it != caps.end() && it->second;
         } catch (const std::exception & e) {
             std::fprintf(stderr, "bmoe: chat template unavailable (%s); using raw prompts\n", e.what());
             im.chat_on = false;
@@ -890,15 +902,46 @@ RunResult Session::generate(const GenerateRequest & req,
     bool prefilled_answer = false; // closed the reasoning span in the prompt, so skip reasoning parse
     common_chat_parser_params parse_params;
     if (chat_on) {
+        // Parsed before the template block and reported as a failure rather than folded into its
+        // fallback: that fallback returns to `req.prompt`, and a caller who sent a conversation has
+        // no raw prompt to return to. Silently rendering nothing is how a bad request turns into an
+        // empty answer with no reason attached.
+        std::vector<common_chat_msg> caller_history;
+        std::vector<common_chat_tool> caller_tools;
         try {
-            common_chat_msg user_msg;
-            user_msg.role = "user";
-            user_msg.content = req.prompt;
-            im.chat_history.push_back(user_msg);
-            history_pushed = true;
+            if (!req.messages_json.empty())
+                caller_history = common_chat_msgs_parse_oaicompat(nlohmann::ordered_json::parse(req.messages_json));
+            if (!req.tools_json.empty())
+                caller_tools = common_chat_tools_parse_oaicompat(nlohmann::ordered_json::parse(req.tools_json));
+        } catch (const std::exception & e) {
+            return fail(std::string("bad request: ") + e.what());
+        }
+
+        try {
+            if (!req.messages_json.empty()) {
+                // The caller owns the conversation. An HTTP API serving several clients has to:
+                // each request carries its own history, and the engine's running one belongs to
+                // whoever asked last. Appending here would send that stranger's turns along with
+                // this request's, so the caller's conversation replaces it outright.
+                //
+                // Parsed by llama.cpp's own OpenAI converter, so `tool` and `assistant` messages
+                // carrying tool calls survive the crossing — a hand-written parser would have to
+                // re-derive rules that already exist a header away.
+                im.chat_history = std::move(caller_history);
+            } else {
+                common_chat_msg user_msg;
+                user_msg.role = "user";
+                user_msg.content = req.prompt;
+                im.chat_history.push_back(user_msg);
+                history_pushed = true;
+            }
 
             common_chat_templates_inputs inputs;
             inputs.messages = im.chat_history; // the full conversation, not just this turn
+            // The model's own template renders the tool section, in whatever syntax its family
+            // uses. Nothing here spells out a tool format, for the same reason nothing here spells
+            // out a reasoning marker.
+            inputs.tools = caller_tools;
             inputs.add_generation_prompt = true;
             inputs.use_jinja = true;
             inputs.enable_thinking = req.think;
@@ -1526,6 +1569,13 @@ RunResult Session::generate(const GenerateRequest & req,
     if (final_parsed) {
         res.generated_text = final_msg.content;
         res.reasoning_text = final_msg.reasoning_content;
+        // Serialized by the same converter an OpenAI client reads, rather than assembled here:
+        // ids, the `function` wrapper and the arguments-as-string convention are its rules, and a
+        // second implementation of them would drift the first time a template family changed.
+        if (!final_msg.tool_calls.empty()) {
+            const nlohmann::ordered_json j = final_msg.to_json_oaicompat();
+            if (j.contains("tool_calls")) res.tool_calls_json = j.at("tool_calls").dump();
+        }
     } else {
         // Not chat, a prefilled turn (the stream IS the answer), or a parse that threw: the raw
         // generation stands on its own, exactly as shown_view would have reported it.

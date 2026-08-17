@@ -30,6 +30,11 @@ struct RunResult {
     // Empty otherwise (chat off, non-reasoning model, harmony no-think). Display-only; the answer
     // in generated_text already has it stripped. See TokenMetrics::reasoning.
     std::string reasoning_text;
+    // Tool calls the model asked for, as an OpenAI-shaped JSON array, or empty when it asked for
+    // none. JSON rather than a struct for the same reason `tools_json` goes in as JSON: this
+    // header is a port and must not name a llama.cpp type. The text of a turn that ends in tool
+    // calls is usually empty, so a caller checks this before deciding the turn produced nothing.
+    std::string tool_calls_json;
     RunSummary summary;
     explicit operator bool() const { return ok; }
 };
