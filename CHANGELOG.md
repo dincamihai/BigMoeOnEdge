@@ -7,6 +7,14 @@ Semantic Versioning.
 ## [Unreleased]
 
 ### Added
+- **The engine says when prefix reuse is impossible.** A memory that refuses a partial `seq_rm`
+  makes the session clear its KV and re-prefill the whole prompt — documented for Gemma's sliding
+  window, but the case that matters is a recurrent one. A Gated Delta Net state (DeepSeek V4 Flash,
+  `qwen35moe`) compresses the past and cannot be cut at a position, so the refusal happens on
+  *every* turn and a conversation pays for its entire history on every question. That was
+  indistinguishable from a client breaking its own prefix; the fallback now reports itself once on
+  stderr. Measured on the same binary, bridge and flags: `qwen3moe` re-prefilled 18 tokens of a
+  53-token prompt on the third turn, `deepseek4` re-prefilled all of it, every time.
 - **Tool calling, and a conversation that survives the trip.** The engine already rendered the
   model's own chat template over structured messages and already parsed the generation with
   `common_chat_parse`, whose tool-call parsing is on by default — so every turn had been filling in

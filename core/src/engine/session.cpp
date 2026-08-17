@@ -1026,9 +1026,22 @@ RunResult Session::generate(const GenerateRequest & req,
         while (n_common < im.kv_tokens.size() && n_common < max_common && im.kv_tokens[n_common] == tokens[n_common])
             ++n_common;
         if (n_common < im.kv_tokens.size()) {
-            // SWA-style memory (e.g. Gemma) can refuse a partial removal; fall back to a full
-            // re-prefill in that case rather than continuing from an inconsistent cache.
+            // SWA-style and recurrent memory (Gemma's sliding window, a Gated Delta Net state)
+            // can refuse a partial removal; fall back to a full re-prefill in that case rather
+            // than continuing from an inconsistent cache.
             if (!llama_memory_seq_rm(llama_get_memory(ctx), 0, (llama_pos) n_common, -1)) {
+                // Said once, because it is a property of the model and not of the turn: silently
+                // it looks exactly like a client that keeps breaking its own prefix, and the
+                // whole prefix-reuse contract reads as broken plumbing instead of a memory that
+                // cannot be cut at a position.
+                static bool said = false;
+                if (!said) {
+                    said = true;
+                    std::fprintf(stderr,
+                                 "bmoe: this model's memory refuses a partial KV removal; every "
+                                 "turn re-prefills the whole prompt (prefix reuse is unavailable "
+                                 "here)\n");
+                }
                 llama_memory_clear(llama_get_memory(ctx), true);
                 n_common = 0;
             }
