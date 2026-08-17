@@ -30,9 +30,9 @@ import java.util.concurrent.atomic.AtomicReference
  *   POST /v1/chat/completions  {"messages":[...], "max_tokens":n, "stream":false}
  *
  * One model, one KV context, one engine queue: generations are strictly serialized here with a
- * single permit, mirroring the constraint the CLI's own session loop already has. `clear_kv`
- * defaults to true — an API caller wants an independent completion — which also resets the chat
- * conversation's KV, an inherent consequence of sharing one context with the UI.
+ * single permit, mirroring the constraint the CLI's own session loop already has. On `/generate`
+ * `clear_kv` defaults to true — a bare prompt is an independent completion. On the chat route it
+ * defaults to FALSE, so a conversation is prefilled once and then extended; see [chat].
  *
  * No authentication: the bind is 0.0.0.0 so the server trusts the network it is on, which is the
  * mesh's job to keep private. Stated in the Settings toggle rather than hidden.
@@ -112,19 +112,28 @@ class ApiServer(port: Int, private val service: RunService) : NanoHTTPD("0.0.0.0
         }
         // The conversation crosses as it arrived. Flattening it into "User:/Assistant:" text cost
         // the model the turn structure its template was trained on, and no `tool` message could
-        // have survived the trip. `clear_kv` stays true: an OpenAI client re-sends the whole
-        // history every turn, so a KV kept from the last caller would duplicate it.
+        // have survived the trip.
+        //
+        // `clear_kv` defaults to FALSE here even though an OpenAI client re-sends its whole history
+        // every turn: `messages` REPLACES the engine-held conversation rather than appending to it,
+        // so a kept KV cannot duplicate anything. The engine diffs the re-rendered tokens against
+        // the KV and prefills only the divergent tail — on a phone that is the difference between
+        // paying for the new turn and paying for the entire conversation, on every question. A
+        // second caller arriving with a different history is still correct; its common prefix is
+        // just shorter, so more of the prompt gets prefilled. Send `"clear_kv": true` to force a
+        // fresh conversation.
         val toolsJson = req.optJSONArray("tools")?.toString() ?: ""
         val conversation = withoutMedia(messages)
         val nPredict = req.optInt("max_tokens", AppSettings.DEFAULT_N_PREDICT)
-        if (req.optBoolean("stream", false)) return stream(conversation, toolsJson, nPredict)
+        val clearKv = req.optBoolean("clear_kv", false)
+        if (req.optBoolean("stream", false)) return stream(conversation, toolsJson, nPredict, clearKv)
 
         return run(
             messagesJson = conversation,
             toolsJson = toolsJson,
             nPredict = nPredict,
             think = false,
-            clearKv = true,
+            clearKv = clearKv,
         ) { r -> completion(r) }
     }
 
@@ -145,7 +154,8 @@ class ApiServer(port: Int, private val service: RunService) : NanoHTTPD("0.0.0.0
      * thread. 256 KB is far more than any answer this model produces in the time a socket stays
      * open, so the ceiling is theoretical; a bounded queue with a drop policy is the upgrade.
      */
-    private fun stream(messagesJson: String, toolsJson: String, nPredict: Int): Response {
+    private fun stream(messagesJson: String, toolsJson: String, nPredict: Int,
+                       clearKv: Boolean): Response {
         if (!runCatching { turn.tryAcquire(GENERATE_TIMEOUT_MIN, TimeUnit.MINUTES) }.getOrDefault(false)) {
             return json(Response.Status.SERVICE_UNAVAILABLE, err("busy: another generation is in flight"))
         }
@@ -154,7 +164,7 @@ class ApiServer(port: Int, private val service: RunService) : NanoHTTPD("0.0.0.0
         // Writes race the client hanging up; a broken pipe is an ordinary end, not a failure.
         fun emit(s: String) = runCatching { sink.write(s); sink.flush() }
 
-        val id = service.generateForApi("", nPredict, think = false, clearKv = true,
+        val id = service.generateForApi("", nPredict, think = false, clearKv = clearKv,
             messagesJson = messagesJson, toolsJson = toolsJson,
             onDelta = { d -> emit("data: ${chunk(delta(d, null))}\n\n") },
             cb = { r ->

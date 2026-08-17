@@ -6,6 +6,15 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+- **The HTTP chat route no longer throws away the KV on every turn.** `/v1/chat/completions`
+  hardcoded `clear_kv = true`, so a phone answering an OpenAI client re-prefilled the entire
+  conversation on every question — the slowest phase of a turn, paid in full, forever. It cannot
+  duplicate history: a caller's `messages` REPLACE the engine-held conversation, and the engine
+  diffs the re-rendered tokens against the KV and prefills only the divergent tail. The default is
+  now `false`, and `"clear_kv": true` still forces a fresh conversation. Measured through the same
+  path on a 1655-token history: 13.6s of prefill became 0.18s.
+
 ### Added
 - **The engine says when prefix reuse is impossible.** A memory that refuses a partial `seq_rm`
   makes the session clear its KV and re-prefill the whole prompt — documented for Gemma's sliding
