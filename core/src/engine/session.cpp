@@ -31,6 +31,7 @@
 #include <cstring>
 #include <exception>
 #include <memory>
+#include <unordered_map>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -503,6 +504,13 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = cfg.n_ctx;
     cparams.n_batch = cfg.n_batch;
+    // Two sequences, one shared pool. Sequence 1 is never generated into: it is the bay a history
+    // edit parks the surviving part of the conversation in while the new middle is prefilled — see
+    // the splice in generate(). kv_unified is what makes the second sequence free: it keeps
+    // n_ctx_seq == n_ctx, where a split cache would hand each sequence half the context for a bay
+    // used a handful of times a session.
+    cparams.n_seq_max = 2;
+    cparams.kv_unified = true;
     // The graph is reserved for the widest ubatch, so this is what sets the resident compute
     // buffers — the memory this engine is always short of. 0 keeps the historical behaviour
     // (one graph as wide as the batch); a smaller value chunks prefill to buy that memory back.
@@ -1020,11 +1028,114 @@ RunResult Session::generate(const GenerateRequest & req,
     // Keeping at least one token to decode means a turn is never a no-op. clear_kv leaves
     // kv_tokens empty, so n_common = 0 and this reduces to a full prefill — the one-shot path the
     // byte-identity gates exercise stays unchanged.
+    //
+    // A history edit — a dropped turn, a folded prefix — does not diverge in a tail but in a HOLE:
+    // the turns after the edit still match, at shifted positions. Reusing them means MOVING those
+    // cells instead of recomputing them. llama.cpp will not decode a batch beginning anywhere but
+    // seq_pos_max + 1 ("it is required that the sequence positions remain consecutive",
+    // llama-batch.cpp), so the block cannot be left in place with a gap in front of it: it is
+    // parked in sequence 1 while the new middle is prefilled into sequence 0, then handed back at
+    // its shifted positions. n_block == 0 is the plain prefix path, unchanged.
     size_t n_common = 0;
+    size_t n_block = 0;      // tokens reused by moving rather than by decoding
+    size_t block_at = 0;     // where the moved block starts in the new prompt
+    size_t n_shift_from = 0; // where it sits in the cache now, i.e. what it is moved from
+    // The parking bay, swept at the top of the turn rather than on each path that could leave it
+    // occupied: a turn that failed or was cancelled mid-splice would otherwise hold those cells for
+    // the rest of the session, and they are the cells the next prompt needs.
+    llama_memory_seq_rm(llama_get_memory(ctx), 1, -1, -1);
+    if (im.ctx_dft) llama_memory_seq_rm(llama_get_memory(im.ctx_dft.get()), 1, -1, -1);
     if (chat_on && !im.kv_tokens.empty()) {
         const size_t max_common = tokens.size() > 0 ? tokens.size() - 1 : 0;
         while (n_common < im.kv_tokens.size() && n_common < max_common && im.kv_tokens[n_common] == tokens[n_common])
             ++n_common;
+        // Below this the seq bookkeeping and the extra decode cost more than the block is worth.
+        // ponytail: a flat threshold, not a model of the crossover — move it if a profile says so.
+        static constexpr size_t kMinSplicedBlock = 256;
+        // The block is anchored at NEITHER end. Not at the end of the new prompt: that carries a
+        // fresh turn header, and after a declined warm-up the whole new question, none of it ever
+        // decoded. Not at the end of the old cache either: that stops on the raw last token the
+        // model generated, and whether those exact tokens reappear in the re-rendered history
+        // depends on the reply surviving a detokenize/retokenize round trip. Anchor it to either
+        // end and the common case silently matches nothing — the splice would be dead code that
+        // still passes every test it has. So the old cache is indexed by a short window and the new
+        // prompt is scanned for the first window that reappears, which is the shape llama.cpp's own
+        // --cache-reuse uses for the same problem.
+        static constexpr size_t kWindow = 32; // long enough that a hit is a real match, not a phrase
+        if (n_common < im.kv_tokens.size()) {
+            const size_t old_len = im.kv_tokens.size();
+            auto window_hash = [](const std::vector<llama_token> & v, size_t i) {
+                uint64_t h = 1469598103934665603ull; // FNV-1a over the window
+                for (size_t k = 0; k < kWindow; ++k) {
+                    h ^= (uint64_t) (uint32_t) v[i + k];
+                    h *= 1099511628211ull;
+                }
+                return h;
+            };
+            if (old_len > n_common + kWindow && tokens.size() > n_common + kWindow) {
+                // Earliest old occurrence wins (the loop walks backwards): it leaves the most room
+                // to extend forward, and a longer block is the whole point.
+                std::unordered_map<uint64_t, size_t> seen;
+                seen.reserve(old_len - n_common);
+                for (size_t i = old_len - kWindow + 1; i-- > n_common;) seen[window_hash(im.kv_tokens, i)] = i;
+                for (size_t np = n_common; np + kWindow < tokens.size(); ++np) {
+                    const auto it = seen.find(window_hash(tokens, np));
+                    if (it == seen.end()) continue;
+                    const size_t op = it->second;
+                    // A hash hit is a candidate, never a match: verify the window, then extend it.
+                    // The last token of the prompt is deliberately left outside — the sampler reads
+                    // the logits of the last decode, so something must still be decoded after the
+                    // block whatever else is reused.
+                    size_t len = 0;
+                    while (len < kWindow && im.kv_tokens[op + len] == tokens[np + len]) ++len;
+                    if (len < kWindow) continue; // collision
+                    while (op + len < old_len && np + len + 1 < tokens.size() &&
+                           im.kv_tokens[op + len] == tokens[np + len])
+                        ++len;
+                    // First accepted hit, not the longest: scanning forward from the divergence,
+                    // the earliest block is the one that leaves the least to re-decode.
+                    n_block = len;
+                    block_at = np;
+                    n_shift_from = op;
+                    break;
+                }
+            }
+            // Both memories must accept the positional shift, and M-RoPE is not a fallback but an
+            // abort: llama_memory_seq_add asserts on n_pos_per_embd() == 1.
+            const bool shiftable = n_block >= kMinSplicedBlock && llama_memory_can_shift(llama_get_memory(ctx)) &&
+                                   llama_model_rope_type(im.model.get()) != LLAMA_ROPE_TYPE_MROPE &&
+                                   (!im.ctx_dft || llama_memory_can_shift(llama_get_memory(im.ctx_dft.get())));
+            if (!shiftable) {
+                n_block = 0;
+            } else {
+                // Only the block is copied out, so whatever the previous turn left beyond it —
+                // the tail of a reply the edit cut away — is not parked and dies with the trim.
+                const llama_pos old_at = (llama_pos) n_shift_from;
+                const llama_pos shift = (llama_pos) block_at - old_at;
+                // Park before trimming: the block has to already belong to sequence 1 when sequence
+                // 0 is cut back to the prefix, or the cut takes it too. Both contexts or neither —
+                // a target that spliced while the draft did not would fail the draft's next batch.
+                auto park = [&](llama_memory_t mem) {
+                    llama_memory_seq_cp(mem, 0, 1, old_at, old_at + (llama_pos) n_block);
+                    if (!llama_memory_seq_rm(mem, 0, (llama_pos) n_common, -1)) return false;
+                    llama_memory_seq_add(mem, 1, old_at, -1, shift);
+                    return true;
+                };
+                bool parked = park(llama_get_memory(ctx));
+                if (parked && im.ctx_dft) parked = park(llama_get_memory(im.ctx_dft.get()));
+                if (!parked) {
+                    // Half a splice describes no state worth continuing from; the full re-prefill
+                    // is always correct, so take it rather than reason about the remains.
+                    llama_memory_clear(llama_get_memory(ctx), true);
+                    if (im.ctx_dft) llama_memory_clear(llama_get_memory(im.ctx_dft.get()), true);
+                    n_common = 0;
+                    n_block = 0;
+                }
+                im.kv_tokens.resize(n_common);
+            }
+        }
+        // Not an else: a splice has already trimmed sequence 0 and left kv_tokens at n_common, so
+        // this reads exactly as it did before the splice existed — the prefix-only path.
         if (n_common < im.kv_tokens.size()) {
             // SWA-style and recurrent memory (Gemma's sliding window, a Gated Delta Net state)
             // can refuse a partial removal; fall back to a full re-prefill in that case rather
@@ -1134,8 +1245,29 @@ RunResult Session::generate(const GenerateRequest & req,
     // context it never uses.
     const bool spec_on = im.cfg.spec.enabled();
     const bool mtp_on = im.mtp != nullptr;
-    for (int i = (int) n_common; i < n_prompt; i += im.cfg.n_batch) {
-        const int chunk = std::min(im.cfg.n_batch, n_prompt - i);
+    // What this turn actually decodes. Without a splice that is one range and the loop below is
+    // the old one verbatim; with a splice it is the new middle, then — once the parked block is
+    // back in sequence 0 — the trailer the new prompt ends with, decoded on top of it so the logits
+    // the sampler reads belong to the end of the prompt and not to the middle.
+    int ranges[2][2] = {{(int) n_common, n_prompt}, {0, 0}};
+    int n_ranges = 1;
+    if (n_block) {
+        ranges[0][1] = (int) block_at;
+        ranges[1][0] = (int) (block_at + n_block);
+        ranges[1][1] = n_prompt;
+        n_ranges = 2;
+    }
+    auto unpark = [&](llama_memory_t mem) {
+        llama_memory_seq_cp(mem, 1, 0, -1, -1);
+        llama_memory_seq_rm(mem, 1, -1, -1); // removing a whole sequence never fails
+    };
+    for (int r = 0; r < n_ranges; ++r) {
+      if (r == 1) {
+        unpark(llama_get_memory(ctx));
+        if (im.ctx_dft) unpark(llama_get_memory(im.ctx_dft.get()));
+      }
+      for (int i = ranges[r][0]; i < ranges[r][1]; i += im.cfg.n_batch) {
+        const int chunk = std::min(im.cfg.n_batch, ranges[r][1] - i);
         llama_batch pf;
         if (mtp_on) {
             // Positions are absolute here — the prompt token at index i sits at position i, reused
@@ -1161,11 +1293,11 @@ RunResult Session::generate(const GenerateRequest & req,
         // or the first draft is made from a hidden state that never saw the prompt.
         if (mtp_on && !common_speculative_process(im.mtp.get(), pf))
             return fail("MTP draft context failed to process the prefill batch");
+      }
     }
-    // The suffix is now in the KV; record it so the next turn can diff against it.
-    if (chat_on)
-        for (int i = (int) n_common; i < n_prompt; ++i)
-            im.kv_tokens.push_back(tokens[i]);
+    // The prompt is now in the KV in full, however little of it had to be decoded to get there:
+    // the reused prefix, the moved block and the freshly prefilled ranges together ARE this list.
+    if (chat_on) im.kv_tokens.assign(tokens.begin(), tokens.end());
     // A penalty stage (DRY today) decides from what the context already contains, and the only
     // tokens it ever sees are the ones accepted here plus the ones it samples itself. Leave the
     // prompt out and the stage is blind to it: a chat whose history repeats a phrase every turn
@@ -1174,8 +1306,9 @@ RunResult Session::generate(const GenerateRequest & req,
     // A turn that rewinds the KV cannot un-accept, so the stage keeps a little stale history;
     // harmless, since its window ages out and the rewound text really was generated.
     if (im.smpl)
-        for (int i = (int) n_common; i < n_prompt; ++i)
-            llama_sampler_accept(im.smpl, tokens[i]);
+        for (int r = 0; r < n_ranges; ++r)
+            for (int i = ranges[r][0]; i < ranges[r][1]; ++i)
+                llama_sampler_accept(im.smpl, tokens[i]);
     // Announced only once the prompt is in both contexts: begin() checks how far the draft context
     // has actually got, so calling it before prefill would warn about a gap that is about to close.
     if (mtp_on) common_speculative_begin(im.mtp.get(), /*seq_id*/ 0, tokens);
@@ -1500,7 +1633,10 @@ RunResult Session::generate(const GenerateRequest & req,
     // Close the accounting: the tail after the last decode belongs to no row, so add it here.
     loop_overhead_s += secs(loop_mark, clock_t_::now());
     s.loop_overhead_s_per_token = n_gen ? loop_overhead_s / n_gen : 0.0;
-    s.n_prompt = n_prompt - (int) n_common; // tokens actually prefilled this turn (after KV reuse)
+    // Tokens actually prefilled this turn. Not n_prompt - n_common: a splice reuses a moved block
+    // as well as a prefix, and this is the number that has to say so.
+    s.n_prompt = 0;
+    for (int r = 0; r < n_ranges; ++r) s.n_prompt += ranges[r][1] - ranges[r][0];
     s.n_past = chat_on ? (int) im.kv_tokens.size() : n_prompt + n_gen; // total context length now
     s.load_seconds = im.load_seconds;
     s.prefill_seconds = prefill_seconds;

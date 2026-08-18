@@ -152,6 +152,21 @@ session_shrink_gen(const RunConfig & c, int shrink_mib, std::string & out1, std:
     return true;
 }
 
+// One OpenAI-shaped message. Plain ASCII on purpose: this model's vocab is byte-fallback, so a
+// character is a token and the sizes below are the token counts they look like — and nothing here
+// has to escape anything to stay valid JSON.
+static std::string msg(const char * role, const std::string & content) {
+    return std::string("{\"role\":\"") + role + "\",\"content\":\"" + content + "\"}";
+}
+
+// A conversation whose opening turn is long enough to be worth dropping and whose remainder is
+// long enough to be worth moving. [head] is what the edit replaces.
+static std::string conversation(const std::string & head) {
+    return "[" + msg("user", head) + "," + msg("assistant", std::string(300, 'b')) + "," +
+           msg("user", std::string(300, 'c')) + "," + msg("assistant", std::string(300, 'd')) + "," +
+           msg("user", "what did we say") + "]";
+}
+
 static int check(const char * name, const std::string & a, const std::string & b) {
     if (a == b) {
         std::printf("[PASS] %s\n", name);
@@ -676,6 +691,72 @@ int main(int argc, char ** argv) {
         } else {
             std::printf("[PASS] G14b route-ahead(1) committed %lld routings (%lld passed through) and generated\n",
                         r.summary.route_ahead_overridden, r.summary.route_ahead_passthrough);
+        }
+    }
+
+    // ── G15: a history edit moves the surviving block instead of re-prefilling it ──
+    //
+    // Turn 1 establishes a conversation. Turn 2 is the same conversation with its long opening
+    // replaced by a short note — a /drop, a folded prefix — so everything after the edit is
+    // unchanged text at shifted positions. That block must be MOVED: the turn has to prefill the
+    // note and the prompt's trailer, not the whole conversation behind it.
+    //
+    // Asserting the count is the point. The splice is the kind of optimisation that can be
+    // completely inert and still pass every test that only checks the answer is sane, so what is
+    // checked is that this turn decoded far fewer tokens than it holds. Turn 3 is checked too,
+    // because every hazard in this area fails one turn LATE: a draft context left unmirrored, a
+    // token list spliced wrong, a parking bay never swept.
+    {
+        SessionConfig sc;
+        sc.model_path = model;
+        sc.n_threads = 2;
+        sc.n_ctx = 2048;
+        sc.n_batch = 512;
+        sc.chatml = true;
+        std::unique_ptr<Session> s = Session::open(sc, err);
+        if (!s) {
+            std::fprintf(stderr, "splice session open failed: %s\n", err.c_str());
+            return 2;
+        }
+        GenerateRequest req;
+        req.n_predict = 4;
+        req.clear_kv = false;
+        req.render_text = false;
+
+        req.messages_json = conversation(std::string(300, 'a'));
+        RunResult r1 = s->generate(req);
+        req.messages_json = conversation("note");
+        RunResult r2 = s->generate(req);
+        // Turn 3 extends the spliced conversation the ordinary way, which is what makes it a check
+        // on the state turn 2 left behind rather than a repeat of turn 2.
+        std::string next = conversation("note");
+        next.pop_back(); // the closing bracket
+        next += "," + msg("assistant", "ok") + "," + msg("user", "and then") + "]";
+        req.messages_json = next;
+        RunResult r3 = s->generate(req);
+
+        if (!r1 || !r2 || !r3) {
+            std::printf("[FAIL] G15 a spliced conversation must keep generating (%s)\n",
+                        (!r1 ? r1 : (!r2 ? r2 : r3)).error.c_str());
+            ++fails;
+        } else {
+            // Asserted for BOTH fixtures, gemma4 included: llama.cpp's swa_full defaults to true,
+            // so even a sliding-window model gets a full-size SWA cache and llama_memory_can_shift
+            // says yes. What is NOT covered by any fixture here is the refusing memory — swa_full
+            // turned off, a recurrent state, an M-RoPE model — which falls back to today's full
+            // re-prefill. That path is a fallback to behaviour every other gate already pins, but
+            // no test in this file forces it.
+            const bool fired = r2.summary.n_prompt * 4 < r2.summary.n_past;
+            const bool still_warm = r3.summary.n_prompt * 4 < r3.summary.n_past;
+            if (!fired || !still_warm) {
+                std::printf("[FAIL] G15 edit prefilled %d/%d, next turn %d/%d — the block was not moved\n",
+                            r2.summary.n_prompt, r2.summary.n_past, r3.summary.n_prompt, r3.summary.n_past);
+                ++fails;
+            } else {
+                std::printf("[PASS] G15 %s history edit prefilled %d of %d tokens (next turn %d of %d)\n",
+                            s->arch().c_str(), r2.summary.n_prompt, r2.summary.n_past, r3.summary.n_prompt,
+                            r3.summary.n_past);
+            }
         }
     }
 
