@@ -64,7 +64,12 @@ class RunService : Service() {
     // The CPU thermal-zone `temp` node, discovered once on the first sample and reused thereafter.
     @Volatile private var cpuThermalZone: File? = null
 
-    private data class Req(val prompt: String, val nPredict: Int, val think: Boolean, val clearKv: Boolean)
+    // messagesJson/toolsJson travel as the JSON text the HTTP caller sent. Nothing here parses
+    // them: the engine renders both through the model's own chat template, and a second reading on
+    // the way would be a second chance to disagree with it. Empty means the UI path, which owns no
+    // conversation of its own and lets the engine keep one.
+    private data class Req(val prompt: String, val nPredict: Int, val think: Boolean, val clearKv: Boolean,
+                           val messagesJson: String = "", val toolsJson: String = "")
 
     // ── embedded HTTP API (ApiServer) ──
     // Requests that arrived over HTTP rather than from the chat UI. Keyed by the same id space
@@ -73,8 +78,11 @@ class RunService : Service() {
     // API traffic. The engine's session loop runs one generation at a time, so at most one API id
     // is active; the field mirrors it so the per-token progress lines (which carry no id) know
     // whether they belong to the UI or to an API caller.
+    // toolCalls is the OpenAI-shaped array the engine parsed out of the generation, "[]" when the
+    // model asked for none. A turn that ends in tool calls usually has empty text, so a caller
+    // reads this before concluding the model said nothing.
     data class ApiResult(val text: String, val reasoning: String, val tokens: Int,
-                         val tokS: Double, val cancelled: Boolean)
+                         val tokS: Double, val cancelled: Boolean, val toolCalls: String = "[]")
     private val apiCallbacks = ConcurrentHashMap<Int, (Result<ApiResult>) -> Unit>()
     // Optional per-token sink for a streaming caller, alongside the once-at-the-end callback above.
     // The engine's progress lines carry the whole text so far, not a delta, so [apiEmitted] records
@@ -118,12 +126,13 @@ class RunService : Service() {
      * `{"cmd":"generate",...}` line the UI path sends; only the result routing differs.
      */
     fun generateForApi(prompt: String, nPredict: Int, think: Boolean, clearKv: Boolean,
+                       messagesJson: String = "", toolsJson: String = "",
                        onDelta: ((String) -> Unit)? = null,
                        cb: (Result<ApiResult>) -> Unit): Int {
         val id = synchronized(writeLock) { nextId++ }
         apiCallbacks[id] = cb
         if (onDelta != null) apiDeltas[id] = onDelta
-        if (!send(generateJson(id, Req(prompt, nPredict, think, clearKv)))) {
+        if (!send(generateJson(id, Req(prompt, nPredict, think, clearKv, messagesJson, toolsJson)))) {
             apiCallbacks.remove(id)
             apiDeltas.remove(id)
             return -1
@@ -370,7 +379,8 @@ class RunService : Service() {
         val result = runCatching {
             val o = JSONObject(json)
             ApiResult(o.optString("text"), o.optString("reasoning"), o.optInt("tokens"),
-                o.optDouble("tok_s"), o.optBoolean("cancelled"))
+                o.optDouble("tok_s"), o.optBoolean("cancelled"),
+                o.optJSONArray("tool_calls")?.toString() ?: "[]")
         }
         // The summary is authoritative: flush any tail the progress lines had not reported before
         // the stream is closed, so a streamed answer equals the non-streamed one.
@@ -619,6 +629,8 @@ class RunService : Service() {
         append(""","n_predict":""").append(req.nPredict)
         append(""","think":""").append(req.think)
         append(""","clear_kv":""").append(req.clearKv)
+        if (req.messagesJson.isNotEmpty()) append(""","messages":""").append(req.messagesJson)
+        if (req.toolsJson.isNotEmpty()) append(""","tools":""").append(req.toolsJson)
         append(""","prompt":"""").append(jsonEscape(req.prompt)).append("\"}")
     }
 

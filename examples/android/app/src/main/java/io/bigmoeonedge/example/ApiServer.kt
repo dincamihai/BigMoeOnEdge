@@ -30,9 +30,9 @@ import java.util.concurrent.atomic.AtomicReference
  *   POST /v1/chat/completions  {"messages":[...], "max_tokens":n, "stream":false}
  *
  * One model, one KV context, one engine queue: generations are strictly serialized here with a
- * single permit, mirroring the constraint the CLI's own session loop already has. `clear_kv`
- * defaults to true — an API caller wants an independent completion — which also resets the chat
- * conversation's KV, an inherent consequence of sharing one context with the UI.
+ * single permit, mirroring the constraint the CLI's own session loop already has. On `/generate`
+ * `clear_kv` defaults to true — a bare prompt is an independent completion. On the chat route it
+ * defaults to FALSE, so a conversation is prefilled once and then extended; see [chat].
  *
  * No authentication: the bind is 0.0.0.0 so the server trusts the network it is on, which is the
  * mesh's job to keep private. Stated in the Settings toggle rather than hidden.
@@ -110,18 +110,30 @@ class ApiServer(port: Int, private val service: RunService) : NanoHTTPD("0.0.0.0
         if (messages == null || messages.length() == 0) {
             return json(Response.Status.BAD_REQUEST, err("missing \"messages\""))
         }
-        // The engine owns the chat template and renders what it is given as a single turn, so the
-        // conversation is flattened into one transcript here. `clear_kv` is therefore always true:
-        // an OpenAI client re-sends the whole history every turn, so any KV we kept would duplicate it.
-        val prompt = flatten(messages)
+        // The conversation crosses as it arrived. Flattening it into "User:/Assistant:" text cost
+        // the model the turn structure its template was trained on, and no `tool` message could
+        // have survived the trip.
+        //
+        // `clear_kv` defaults to FALSE here even though an OpenAI client re-sends its whole history
+        // every turn: `messages` REPLACES the engine-held conversation rather than appending to it,
+        // so a kept KV cannot duplicate anything. The engine diffs the re-rendered tokens against
+        // the KV and prefills only the divergent tail — on a phone that is the difference between
+        // paying for the new turn and paying for the entire conversation, on every question. A
+        // second caller arriving with a different history is still correct; its common prefix is
+        // just shorter, so more of the prompt gets prefilled. Send `"clear_kv": true` to force a
+        // fresh conversation.
+        val toolsJson = req.optJSONArray("tools")?.toString() ?: ""
+        val conversation = withoutMedia(messages)
         val nPredict = req.optInt("max_tokens", AppSettings.DEFAULT_N_PREDICT)
-        if (req.optBoolean("stream", false)) return stream(prompt, nPredict)
+        val clearKv = req.optBoolean("clear_kv", false)
+        if (req.optBoolean("stream", false)) return stream(conversation, toolsJson, nPredict, clearKv)
 
         return run(
-            prompt = prompt,
+            messagesJson = conversation,
+            toolsJson = toolsJson,
             nPredict = nPredict,
             think = false,
-            clearKv = true,
+            clearKv = clearKv,
         ) { r -> completion(r) }
     }
 
@@ -142,7 +154,8 @@ class ApiServer(port: Int, private val service: RunService) : NanoHTTPD("0.0.0.0
      * thread. 256 KB is far more than any answer this model produces in the time a socket stays
      * open, so the ceiling is theoretical; a bounded queue with a drop policy is the upgrade.
      */
-    private fun stream(prompt: String, nPredict: Int): Response {
+    private fun stream(messagesJson: String, toolsJson: String, nPredict: Int,
+                       clearKv: Boolean): Response {
         if (!runCatching { turn.tryAcquire(GENERATE_TIMEOUT_MIN, TimeUnit.MINUTES) }.getOrDefault(false)) {
             return json(Response.Status.SERVICE_UNAVAILABLE, err("busy: another generation is in flight"))
         }
@@ -151,7 +164,8 @@ class ApiServer(port: Int, private val service: RunService) : NanoHTTPD("0.0.0.0
         // Writes race the client hanging up; a broken pipe is an ordinary end, not a failure.
         fun emit(s: String) = runCatching { sink.write(s); sink.flush() }
 
-        val id = service.generateForApi(prompt, nPredict, think = false, clearKv = true,
+        val id = service.generateForApi("", nPredict, think = false, clearKv = clearKv,
+            messagesJson = messagesJson, toolsJson = toolsJson,
             onDelta = { d -> emit("data: ${chunk(delta(d, null))}\n\n") },
             cb = { r ->
                 r.fold(
@@ -181,35 +195,46 @@ class ApiServer(port: Int, private val service: RunService) : NanoHTTPD("0.0.0.0
             .put("finish_reason", finish ?: JSONObject.NULL)
     }
 
-    private fun flatten(messages: JSONArray): String = buildString {
+    /**
+     * The conversation with non-text content parts removed.
+     *
+     * Several clients always send OpenAI's content-part array, and some put an image in it. The
+     * engine hands messages to llama.cpp, which REJECTS a part type it cannot render — so passing
+     * one through would turn a picture nobody could have described into a failed request. This
+     * phone has no vision path; dropping the part and answering the text is what it did before
+     * structured messages, and the tolerance is worth keeping.
+     */
+    private fun withoutMedia(messages: JSONArray): String {
+        val out = JSONArray()
         for (i in 0 until messages.length()) {
             val m = messages.optJSONObject(i) ?: continue
-            val content = textOf(m.opt("content"))
-            if (content.isEmpty()) continue
-            when (m.optString("role")) {
-                "system" -> append(content).append("\n\n")
-                "assistant" -> append("Assistant: ").append(content).append("\n")
-                else -> append("User: ").append(content).append("\n")
+            val parts = m.opt("content") as? JSONArray
+            if (parts == null) {
+                out.put(m)
+                continue
             }
+            val kept = JSONArray()
+            for (j in 0 until parts.length()) {
+                val part = parts.optJSONObject(j) ?: continue
+                if (part.optString("type") == "text") kept.put(part)
+            }
+            // A message left with no renderable content is dropped whole: an empty content array
+            // is not a message any template knows how to render.
+            if (kept.length() > 0) out.put(JSONObject(m.toString()).put("content", kept))
         }
-    }.trimEnd()
-
-    /**
-     * A message's content is either a plain string or OpenAI's content-part array — several clients
-     * always send the array form. Only text parts are kept; this phone has no vision path, so an
-     * image part is dropped rather than faked.
-     */
-    private fun textOf(content: Any?): String = when (content) {
-        is JSONArray -> (0 until content.length())
-            .mapNotNull { content.optJSONObject(it)?.optString("text")?.ifEmpty { null } }
-            .joinToString(" ")
-        null, JSONObject.NULL -> ""
-        else -> content.toString()
+        return out.toString()
     }
 
     private fun completion(r: RunService.ApiResult): Response {
-        val message = JSONObject().put("role", "assistant").put("content", r.text)
-        val choice = JSONObject().put("index", 0).put("message", message).put("finish_reason", finish(r))
+        val calls = JSONArray(r.toolCalls)
+        // A turn that ends in tool calls carries no answer text, and an OpenAI client reads
+        // finish_reason to know that before it reads content — reporting "stop" there would make a
+        // waiting agent believe the model had simply said nothing.
+        val message = JSONObject().put("role", "assistant")
+            .put("content", if (r.text.isEmpty() && calls.length() > 0) JSONObject.NULL else r.text)
+        if (calls.length() > 0) message.put("tool_calls", calls)
+        val choice = JSONObject().put("index", 0).put("message", message)
+            .put("finish_reason", if (calls.length() > 0) "tool_calls" else finish(r))
         val usage = JSONObject()
             .put("prompt_tokens", 0) // the engine reports generated tokens only
             .put("completion_tokens", r.tokens)
@@ -246,7 +271,15 @@ class ApiServer(port: Int, private val service: RunService) : NanoHTTPD("0.0.0.0
      * One generation, serialized against every other API caller, rendered by [onSuccess]. Every
      * failure path answers with a status a client can act on rather than leaving it hanging.
      */
-    private fun run(prompt: String, nPredict: Int, think: Boolean, clearKv: Boolean,
+    /**
+     * One generation, whichever way the caller expressed it.
+     *
+     * `/generate` sends a bare prompt and lets the engine keep the conversation; `/v1/chat/...`
+     * sends the whole conversation and owns it. Exactly one of [prompt] and [messagesJson] carries
+     * the turn — the engine ignores `prompt` when messages are present.
+     */
+    private fun run(prompt: String = "", messagesJson: String = "", toolsJson: String = "",
+                    nPredict: Int, think: Boolean, clearKv: Boolean,
                     onSuccess: (RunService.ApiResult) -> Response): Response {
         // Wait for the session to be free of other API callers. The wait is bounded by the same
         // ceiling as the generation itself, so a caller behind a long job times out rather than
@@ -257,7 +290,7 @@ class ApiServer(port: Int, private val service: RunService) : NanoHTTPD("0.0.0.0
         try {
             val done = CountDownLatch(1)
             val result = AtomicReference<Result<RunService.ApiResult>>()
-            val id = service.generateForApi(prompt, nPredict, think, clearKv) { r ->
+            val id = service.generateForApi(prompt, nPredict, think, clearKv, messagesJson, toolsJson) { r ->
                 result.set(r); done.countDown()
             }
             if (id < 0) {

@@ -41,8 +41,14 @@ for its own tokens, not a full re-prefill — which matters because prefill is t
 device. `BMOE_DONE.n_prompt` reports the tokens actually prefilled this turn; `n_past` is the total
 context length after it.
 
-**Fallbacks and costs.** SWA-style memory (e.g. Gemma) can refuse a partial `seq_rm`; the engine
-then clears the KV and re-prefills the whole prompt for that turn (correct, just slower). With
+**Fallbacks and costs.** SWA-style *and recurrent* memory can refuse a partial `seq_rm`; the engine
+then clears the KV and re-prefills the whole prompt for that turn (correct, just slower). Gemma's
+sliding window is one case; a linear-attention state is the harder one — a Gated Delta Net (DeepSeek
+V4 Flash, Qwen3.6/`qwen35moe`) compresses the past into a state that cannot be cut at a position, so
+the refusal is not occasional but **every turn**: prefix reuse is simply unavailable for that family,
+and a conversation pays for its whole history on every question. The engine says so once on stderr
+rather than leaving it to be inferred, because silently it looks identical to a client that keeps
+breaking its own prefix. Classic-attention MoEs (`qwen3moe`, `gpt-oss`) reuse normally. With
 thinking **on**, the template strips the previous turn's reasoning on re-render, so the rendered
 prefix diverges at the last answer and up to one answer's worth of tokens is re-prefilled per turn;
 with thinking **off** (the app default) the re-fed suffix is just the new user turn plus a few

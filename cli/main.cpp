@@ -16,6 +16,8 @@
 #include "bmoe/decode_trace.h"
 #include "bmoe/version.h"
 
+#include "nlohmann/json.hpp"
+
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
@@ -109,107 +111,23 @@ static void emit_progress_line(const TokenMetrics & m, ProgressDelta & st) {
     std::fflush(stdout);
 }
 
-// ── minimal flat-JSON reading for the --session request protocol ──
-// The session request objects are flat (string/int/bool fields only), so a tiny hand-rolled
-// extractor keeps the CLI dependency-free, mirroring the hand-written JSON it already emits.
-
-static std::string json_unescape(const std::string & s) {
-    std::string o;
-    o.reserve(s.size());
-    for (size_t i = 0; i < s.size(); ++i) {
-        if (s[i] != '\\' || i + 1 >= s.size()) {
-            o += s[i];
-            continue;
-        }
-        char c = s[++i];
-        switch (c) {
-        case 'n':
-            o += '\n';
-            break;
-        case 'r':
-            o += '\r';
-            break;
-        case 't':
-            o += '\t';
-            break;
-        case '"':
-            o += '"';
-            break;
-        case '\\':
-            o += '\\';
-            break;
-        case '/':
-            o += '/';
-            break;
-        case 'u':
-            if (i + 4 < s.size()) {
-                int code = (int) std::strtol(s.substr(i + 1, 4).c_str(), nullptr, 16);
-                // The protocol only carries ASCII control chars as \u00xx (from json_escape);
-                // decode those directly. Anything else is passed through as the literal char.
-                o += (char) (code & 0xff);
-                i += 4;
-            }
-            break;
-        default:
-            o += c;
-            break;
-        }
-    }
-    return o;
-}
-
-// Find `"key"`, skip to its value. Returns the index just past the colon, or npos.
-static size_t json_value_pos(const std::string & line, const char * key) {
-    std::string pat = std::string("\"") + key + "\"";
-    size_t k = line.find(pat);
-    if (k == std::string::npos) return std::string::npos;
-    size_t c = line.find(':', k + pat.size());
-    if (c == std::string::npos) return std::string::npos;
-    return c + 1;
-}
-
-static bool json_get_string(const std::string & line, const char * key, std::string & out) {
-    size_t p = json_value_pos(line, key);
-    if (p == std::string::npos) return false;
-    while (p < line.size() && (line[p] == ' ' || line[p] == '\t'))
-        ++p;
-    if (p >= line.size() || line[p] != '"') return false;
-    ++p;
-    std::string raw;
-    for (; p < line.size(); ++p) {
-        if (line[p] == '\\' && p + 1 < line.size()) {
-            raw += line[p];
-            raw += line[p + 1];
-            ++p;
-        } else if (line[p] == '"') {
-            break;
-        } else {
-            raw += line[p];
-        }
-    }
-    out = json_unescape(raw);
-    return true;
-}
-
-static int json_get_int(const std::string & line, const char * key, int dflt) {
-    size_t p = json_value_pos(line, key);
-    if (p == std::string::npos) return dflt;
-    return std::atoi(line.c_str() + p);
-}
-
-static bool json_get_bool(const std::string & line, const char * key, bool dflt) {
-    size_t p = json_value_pos(line, key);
-    if (p == std::string::npos) return dflt;
-    while (p < line.size() && (line[p] == ' ' || line[p] == '\t'))
-        ++p;
-    return line.compare(p, 4, "true") == 0;
-}
+// ── reading the --session request protocol ──
+// A request used to be flat (string/int/bool only) and a hand-rolled extractor kept the CLI free of
+// a JSON dependency. `messages` and `tools` ended that: they are arrays of objects carrying
+// arbitrary user text, and a substring scan for `"prompt"` would happily match one written inside a
+// message. The parser comes with llama.cpp's common utils, which bmoe_core already links, so
+// reading the line properly costs nothing that was not already linked in.
 
 // A parsed stdin command. cancel is handled inline by the reader thread (it calls
 // Session::cancel directly), so only generate/close travel through the queue.
 struct SessionCmd {
     enum Kind { kGenerate, kClose } kind;
     std::string prompt;
+    // Forwarded to the engine as the JSON text they arrived as. The CLI has no reason to
+    // understand a conversation or a tool schema; the engine parses both with llama.cpp's OpenAI
+    // converters, and a second interpretation here could only disagree with it.
+    std::string messages_json;
+    std::string tools_json;
     int id = 0;
     int n_predict = 128;
     bool think = true;
@@ -238,10 +156,13 @@ static int run_session_loop(const RunConfig & cfg,
     // n_expert_used is the EFFECTIVE routing width, after any override. A UI needs it to say
     // anything sensible about --drop-cold-experts, whose threshold is a fraction of 1/top-k: the
     // same percentage trims a tail at 8 and takes half the routing at 2. 0 on a non-MoE model.
+    // tools states whether this model's template describes tools, so a caller can grey out a
+    // tool-using feature instead of sending schemas the template silently drops.
     std::printf("BMOE_READY {\"load_s\":%.3f,\"arch\":\"%s\",\"n_ctx\":%d,\"think_ctl\":\"%s\","
-                "\"n_expert_used\":%d}\n",
+                "\"n_expert_used\":%d,\"tools\":%s}\n",
                 session->load_seconds(), json_escape(session->arch()).c_str(), session->n_ctx(),
-                bmoe::think_control_name(session->think_control()), session->n_expert_used());
+                bmoe::think_control_name(session->think_control()), session->n_expert_used(),
+                session->supports_tools() ? "true" : "false");
     std::fflush(stdout);
 
     std::mutex mtx;
@@ -255,8 +176,16 @@ static int run_session_loop(const RunConfig & cfg,
     std::thread reader([&] {
         std::string line;
         while (std::getline(std::cin, line)) {
-            std::string cmd;
-            if (!json_get_string(line, "cmd", cmd)) continue;
+            nlohmann::json req;
+            // A malformed line is one caller's mistake, not the session's death: skip it and keep
+            // reading, the same way an unknown command is skipped.
+            try {
+                req = nlohmann::json::parse(line);
+            } catch (const std::exception &) {
+                continue;
+            }
+            if (!req.is_object()) continue;
+            const std::string cmd = req.value("cmd", std::string());
             if (cmd == "cancel") {
                 session->cancel();
                 continue;
@@ -266,11 +195,13 @@ static int run_session_loop(const RunConfig & cfg,
                 c.kind = SessionCmd::kClose;
             } else if (cmd == "generate") {
                 c.kind = SessionCmd::kGenerate;
-                json_get_string(line, "prompt", c.prompt);
-                c.id = json_get_int(line, "id", 0);
-                c.n_predict = json_get_int(line, "n_predict", cfg.n_predict);
-                c.think = json_get_bool(line, "think", cfg.think);
-                c.clear_kv = json_get_bool(line, "clear_kv", true);
+                c.prompt = req.value("prompt", std::string());
+                if (req.contains("messages")) c.messages_json = req.at("messages").dump();
+                if (req.contains("tools")) c.tools_json = req.at("tools").dump();
+                c.id = req.value("id", 0);
+                c.n_predict = req.value("n_predict", cfg.n_predict);
+                c.think = req.value("think", cfg.think);
+                c.clear_kv = req.value("clear_kv", true);
             } else {
                 continue;
             }
@@ -283,7 +214,7 @@ static int run_session_loop(const RunConfig & cfg,
         {
             std::lock_guard<std::mutex> lk(mtx);
             stop.store(true);
-            queue.push_back({SessionCmd::kClose, "", 0, 0, true, true});
+            queue.push_back(SessionCmd{SessionCmd::kClose});
         }
         cv.notify_one();
     });
@@ -304,6 +235,8 @@ static int run_session_loop(const RunConfig & cfg,
 
         GenerateRequest req;
         req.prompt = cmd.prompt;
+        req.messages_json = cmd.messages_json;
+        req.tools_json = cmd.tools_json;
         req.n_predict = cmd.n_predict;
         req.think = cmd.think;
         req.clear_kv = cmd.clear_kv;
@@ -332,14 +265,16 @@ static int run_session_loop(const RunConfig & cfg,
                     "\"read_mib\":%.1f,\"stall_s_tok\":%.4f,\"mgmt_s_tok\":%.4f,\"majflt_tok\":%.2f,\"cpu_s_tok\":%.4f,"
                     "\"token_demand_mib\":%.1f,\"mtp_drafted\":%lld,\"mtp_accepted\":%lld,\"mtp_decodes\":%lld,"
                     "\"mtp_draft_s_tok\":%.4f,\"drafted_steps\":%lld,\"loop_overhead_s_tok\":%.4f,"
-                    "\"reasoning\":\"%s\",\"text\":\"%s\"}\n",
+                    "\"reasoning\":\"%s\",\"tool_calls\":%s,\"text\":\"%s\"}\n",
                     cmd.id, r.cancelled ? "true" : "false", s.n_generated, s.tokens_per_second, s.prefill_seconds,
                     (s.prefill_seconds > 0 ? s.n_prompt / s.prefill_seconds : 0.0), s.load_seconds, s.cache_hit_pct,
                     s.n_prompt, s.n_past, s.moe_compute_s_per_token, s.moe_io_s_per_token, s.cache_resident_mib,
                     s.cache_budget_mib, s.moe_read_mib, s.moe_stall_s_per_token, s.moe_mgmt_s_per_token,
                     s.majflt_per_token, s.cpu_s_per_token, s.token_demand_mib, s.mtp_drafted, s.mtp_accepted,
                     s.mtp_decodes, s.mtp_draft_s_per_token, s.drafted_steps, s.loop_overhead_s_per_token,
-                    json_escape(r.reasoning_text).c_str(), json_escape(r.generated_text).c_str());
+                    json_escape(r.reasoning_text).c_str(),
+                    r.tool_calls_json.empty() ? "[]" : r.tool_calls_json.c_str(),
+                    json_escape(r.generated_text).c_str());
         std::fflush(stdout);
     }
 

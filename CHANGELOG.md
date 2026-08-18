@@ -6,7 +6,48 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+- **The HTTP chat route no longer throws away the KV on every turn.** `/v1/chat/completions`
+  hardcoded `clear_kv = true`, so a phone answering an OpenAI client re-prefilled the entire
+  conversation on every question — the slowest phase of a turn, paid in full, forever. It cannot
+  duplicate history: a caller's `messages` REPLACE the engine-held conversation, and the engine
+  diffs the re-rendered tokens against the KV and prefills only the divergent tail. The default is
+  now `false`, and `"clear_kv": true` still forces a fresh conversation. Measured through the same
+  path on a 1655-token history: 13.6s of prefill became 0.18s.
+
 ### Added
+- **The engine says when prefix reuse is impossible.** A memory that refuses a partial `seq_rm`
+  makes the session clear its KV and re-prefill the whole prompt — documented for Gemma's sliding
+  window, but the case that matters is a recurrent one. A Gated Delta Net state (DeepSeek V4 Flash,
+  `qwen35moe`) compresses the past and cannot be cut at a position, so the refusal happens on
+  *every* turn and a conversation pays for its entire history on every question. That was
+  indistinguishable from a client breaking its own prefix; the fallback now reports itself once on
+  stderr. Measured on the same binary, bridge and flags: `qwen3moe` re-prefilled 18 tokens of a
+  53-token prompt on the third turn, `deepseek4` re-prefilled all of it, every time.
+- **Tool calling, and a conversation that survives the trip.** The engine already rendered the
+  model's own chat template over structured messages and already parsed the generation with
+  `common_chat_parse`, whose tool-call parsing is on by default — so every turn had been filling in
+  `tool_calls` that nothing read. `GenerateRequest` now carries `messages_json` and `tools_json`
+  (JSON text, because `core/include/bmoe` names no llama.cpp type), parsed with llama.cpp's own
+  OpenAI converters, and `RunResult` returns `tool_calls_json`. `messages` **replaces** the
+  engine-held conversation for that turn: an HTTP API serving several clients cannot use a running
+  history, because each request arrives with its own. `BMOE_DONE` gained `tool_calls`, and
+  `BMOE_READY` gained `tools` — a template that does not describe tools renders a prompt identical
+  to one sent without them, so without that flag a caller waits for a call that can never arrive,
+  the same trap `think_ctl` was added to close. Nothing here spells out any model's tool syntax;
+  the template does.
+- The Android app's `/v1/chat/completions` passes the conversation through as messages instead of
+  flattening it into `User:`/`Assistant:` text. The flattening cost every API answer the turn
+  structure the model was trained on, and no `tool` message could have survived it. Answers now
+  carry `tool_calls` with `finish_reason: "tool_calls"`. Content parts that are not text are still
+  dropped rather than rejected — this phone has no vision path, and llama.cpp refuses a part type
+  it cannot render.
+
+### Changed
+- `bmoe-cli`'s session protocol is read with a real JSON parser. The hand-rolled extractor it
+  replaced was justified by requests being flat (string/int/bool only), which `messages` and
+  `tools` ended; its substring scan for `"prompt"` would also have matched one written inside a
+  message. The parser ships with llama.cpp's common utils, which `bmoe_core` already links.
 - **DRY sampling, and the prompt is finally visible to the sampler.** A multi-turn chat would
   reopen every reply with the same memorised phrase, and no amount of `--temp` fixed it: the
   narrowing stages keep whichever token is most probable, and after a few identical openings in the
