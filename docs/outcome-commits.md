@@ -158,11 +158,32 @@ to 4000 characters precisely because an oversized observation stays in history a
 EVERY later turn (id:507). That is this idea with a blunt instrument — truncating by length rather
 than compacting by meaning, and discarding the tail whether or not the tail mattered.
 
-**The question to answer before building any of it**, and it is cheap: is compacting an agent's
-tool-call history acceptable at all, or must the CALLS survive verbatim while only their
-OBSERVATIONS compact? Run a task under `ds4-agent` on Hetzner, compact the middle by hand, and see
-whether it re-runs tools it already ran. That experiment costs an afternoon and decides the shape
-of B's summariser.
+**MEASURED 2026-08-19** (ds4-agent installed on evo, DSv4-Flash on :8099, smolagents 1.26.0;
+harness at `/tmp/compactlab/exp.py`, throwaway). Two tool-using turns, then the history compacted
+four ways, then a probe needing BOTH earlier results. The measurement is how many tool calls the
+probe makes:
+
+    control  nothing compacted                          0 calls, answered from memory
+    obs      observations summarised, CALLS KEPT        0 calls
+    full     whole span replaced, CALLS DELETED         0 calls
+    lossy    span replaced, one file's result DROPPED   2 calls, re-read BOTH files
+
+Three results, and they settle the question:
+
+1. **Tool calls do NOT have to survive verbatim.** `full` deleted them outright and behaved
+   identically to the control. Losing the STRUCTURE neither confuses the agent nor makes it repeat
+   work, so the summariser may compact calls and observations together.
+2. **Losing a FACT causes recovery, not invention.** With one file's result dropped, the agent
+   noticed and re-read rather than fabricating a plausible marker. That is the good failure.
+3. **Recovery is not surgical.** It re-read BOTH files, including the one the summary still
+   described. A lossy summary therefore costs a re-fetch of the whole span, not of the missing
+   piece — which is the argument for spending effort on the summary rather than trusting recovery.
+
+WHAT THIS EXPERIMENT DOES NOT COVER, and it is the dangerous part: the only tool was `read_file` —
+cheap, idempotent, safe to repeat. Recovery by re-running `write_file` or `run_shell` is not a cost,
+it is damage. Before B compacts for an agent holding side-effecting tools, either the summariser
+must be held to preserving every side effect already performed, or such tools must be excluded from
+compaction and kept verbatim. Untested; do not assume the read-only result transfers.
 
 ## What is open
 
