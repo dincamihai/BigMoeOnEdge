@@ -127,6 +127,43 @@ for an arbitrary agent the engine must decide what and when to compact. Build A 
 drafting discipline and the negative-results rule get proven with somebody checking them before
 they are ever allowed to run unattended.
 
+## Agents
+
+An agent is the case that makes B worth building, and the case where A quietly stops making sense.
+
+**A does not fit an agent.** The whole value of a commit is that a human decides a span is settled
+and approves the text that replaces it. Inside an agent loop there is no human at that moment, so
+A degenerates into "the agent summarises itself on a timer", which is ordinary compaction with
+extra ceremony and none of the review that makes it safe.
+
+**B needs nothing from the agent.** With the engine hashing messages and mapping raw turns onto the
+outcome that replaced them, an agent keeps sending its full transcript, believes nothing changed,
+and is served a compacted KV underneath. No fork, no wrapper, no library change.
+
+That said, if someone does want A in an agent, it is NOT a fork either. smolagents keeps its
+history in `agent.memory.steps` (`TaskStep` / `ActionStep` / `PlanningStep`) and rebuilds the
+message list from it each step via `write_memory_to_messages()`; `run(reset=False)` preserves it
+across turns, which is what `ds4-agent` already depends on (engram id:507). Replacing a span of
+that list with one outcome step is a function operating on a public attribute, with
+`step_callbacks` available as the trigger. Verify against the installed version before relying on
+it — this is from knowledge of the library, and the venv lives on the Hetzner box, not here.
+
+**The risk is sharper for an agent than for chat, and it is not the same risk.** A chat loses prose
+detail. An agent loses STRUCTURE: "I called read_file on this path and got that" collapses into
+prose, and what follows is the negative-result failure (engram id:315) in its most expensive form —
+the agent re-runs tools it has already run, pays for them again, and looks busy while doing it.
+
+There is prior art for the crude version in the same codebase: `ds4-agent` clips every tool result
+to 4000 characters precisely because an oversized observation stays in history and costs prefill on
+EVERY later turn (id:507). That is this idea with a blunt instrument — truncating by length rather
+than compacting by meaning, and discarding the tail whether or not the tail mattered.
+
+**The question to answer before building any of it**, and it is cheap: is compacting an agent's
+tool-call history acceptable at all, or must the CALLS survive verbatim while only their
+OBSERVATIONS compact? Run a task under `ds4-agent` on Hetzner, compact the middle by hand, and see
+whether it re-runs tools it already ran. That experiment costs an afternoon and decides the shape
+of B's summariser.
+
 ## What is open
 
 1. **Committing mid-thought.** Committing a PREFIX of the uncommitted tail and keeping the rest is
