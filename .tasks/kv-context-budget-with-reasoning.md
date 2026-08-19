@@ -47,6 +47,27 @@ tail cell. That is safe because `find_slot` is copy-on-write — a cell with mor
 is forked into a fresh cell carrying the original's `src`. Decoding into the copy leaves the source
 untouched. If that ever changes, the scratch-sequence design breaks silently.
 
+## What the shipped fix changed about this question (2026-08-19)
+
+`kv-canonical-scratch-sequences.md` landed, so the premise above is now half-obsolete and the card
+should be read with that in mind. The canonical sequence grows at the CLEAN rate — the 5-8x
+inflation does not happen, and the "drop the old reasoning" idea has nothing to drop.
+
+What replaced it is a narrower and more concrete pressure: the WORKING sequence still holds the
+whole turn, prompt plus every reasoning token, because that is what the model is generating into.
+So the peak context of a session is no longer "the conversation" but
+
+    len(canonical) + this turn's n_gen
+
+and `n_gen` is where the reasoning lives. Measured on DSv4-Flash at `-c 4096`, a 3-turn toy
+conversation reached canonical=52 with n_gen up to 220, so the peak was dominated entirely by the
+turn in flight. A long thinking answer on a long conversation is what actually approaches n_ctx now,
+and it does so within a SINGLE turn rather than by accumulating across them.
+
+That reframes the open items below: a reset that trims history does nothing for a turn whose own
+reasoning is what fills the window. Whatever is designed here has to handle the in-turn case, which
+is closer to "what happens when a turn cannot finish" than to a budgeting policy.
+
 ## What is actually open
 
 1. **Long conversations still end.** Sequence 0 grows at the clean rate, which is slow, but it is
