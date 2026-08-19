@@ -495,9 +495,19 @@ static void handle_completions(int fd, const HttpRequest & req, ServerState & st
                    "\"role\":\"assistant\","
                    "\"content\":\"" +
                    json_escape(result.generated_text) +
-                   "\""
+                   "\"" +
+                   // When the engine's chat parser recognises a tool call, the call is what the
+                   // turn produced and generated_text is empty. Reporting only content therefore
+                   // answers a tools request with 200, "" and finish_reason "stop": the caller
+                   // cannot tell a refusal from a dropped call. tool_calls_json is already
+                   // OpenAI-shaped, so it goes out verbatim.
+                   (result.tool_calls_json.empty()
+                        ? std::string()
+                        : ",\"tool_calls\":" + result.tool_calls_json) +
                    "},"
-                   "\"finish_reason\":\"stop\""
+                   "\"finish_reason\":\"" +
+                   (result.tool_calls_json.empty() ? "stop" : "tool_calls") +
+                   "\""
                    "}],"
                    "\"usage\":{"
                    "\"prompt_tokens\":" +
@@ -589,6 +599,17 @@ static void handle_completions(int fd, const HttpRequest & req, ServerState & st
 
     auto result = state.session->generate(greq, on_token, nullptr);
     if (result) {
+        // A recognised tool call is only known once the turn ends — the chat parser cannot decide
+        // mid-stream whether a partial looks like a call or ordinary text. So it cannot be streamed
+        // incrementally the way OpenAI emits it; it goes out whole, in one delta before the final
+        // frame. Without this the stream carries no pieces at all (generated_text is empty when the
+        // turn produced a call) and ends on "stop" — the caller sees a successful, silent turn.
+        if (chat && !result.tool_calls_json.empty()) {
+            send_sse(fd, "{\"id\":\"" + id_prefix + "-" + std::to_string(created) +
+                             "\",\"object\":\"" + object + "\",\"created\":" + std::to_string(created) +
+                             ",\"model\":\"bmoe\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":" +
+                             result.tool_calls_json + "},\"finish_reason\":null}]}");
+        }
         // Final chunk with usage and finish_reason
         std::string data = "{\"id\":\"" + id_prefix + "-" + std::to_string(created) +
                            "\","
@@ -602,7 +623,9 @@ static void handle_completions(int fd, const HttpRequest & req, ServerState & st
                            "\"choices\":[{"
                            "\"index\":0,"
                            "\"delta\":{},"
-                           "\"finish_reason\":\"stop\""
+                           "\"finish_reason\":\"" +
+                           std::string(chat && !result.tool_calls_json.empty() ? "tool_calls" : "stop") +
+                           "\""
                            "}],"
                            "\"usage\":{"
                            "\"prompt_tokens\":" +
