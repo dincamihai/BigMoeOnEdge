@@ -1,6 +1,6 @@
 # KV prefix reuse is lost on recurrent-memory models
 
-column: Todo
+column: Doing
 created: 2026-08-19
 
 ## Symptom
@@ -102,6 +102,63 @@ Discriminating experiment: log `n_common`, `im.kv_tokens.size()` and `tokens.siz
 every turn for both models. If H1, `n_common` is close to but below `kv_tokens.size()`
 (a short tail). If H2, the numbers match on qwen3moe and the difference is only that
 `seq_rm` returns false on DSv4.
+
+## RESULT of the discriminating experiment (2026-08-19, run on evo)
+
+**H1 is true. H2 is false.** Both halves measured with `BMOE_KV_TRACE=1` against
+`build-native/cli/bmoe-server`, 3 append-only turns, `temperature 0`, stderr visible.
+
+qwen3moe (`qwen3-coder:30b`), the model that already works:
+
+    turn2  prefix n_common=27  kv_tokens=27   tokens=42  tail=0    rewind=no
+    turn3  prefix n_common=52  kv_tokens=52   tokens=67  tail=0    rewind=no
+    prompt_tokens 21 -> 15 -> 15,  wall 2.16s -> 0.60s -> 0.61s
+
+DeepSeek-V4-Flash-0731 UD-IQ3_XXS:
+
+    turn1  turn-start kv_tokens=0             turn-end kv_tokens=105  n_prompt=13 n_gen=92
+    turn2  prefix n_common=12  kv_tokens=105  tokens=30  tail=93   rewind=yes
+           bmoe: this model's memory refuses a partial KV removal; ...
+    turn3  prefix n_common=29  kv_tokens=187  tokens=53  tail=158  rewind=yes
+    prompt_tokens 13 -> 30 -> 53 (full re-prefill every turn), wall 29.9s -> 49.9s -> 58.8s
+
+Read the qwen line first: `tail=0`, so `n_common == kv_tokens.size()` and the failing branch is
+never entered. The re-rendered history there is a STRICT TOKEN-PREFIX of what was decoded — the
+engine's rewind machinery is not what makes qwen work, the absence of any need to rewind is.
+
+Now DSv4. `n_common` stops exactly ONE TOKEN SHORT of the previous turn's rendered prompt
+(turn3: 29 against a turn-2 render of 30 tokens). Everything past that point in the cache is the
+`n_gen` tokens the model GENERATED, and those do not reappear in the next render. So the tail is
+not a template-whitespace nibble; it is the whole generated turn, and it grows with the answer.
+
+The reason the generated tokens do not reappear is the reasoning span. DSv4 is a thinking model:
+turn 1 generated 92 tokens whose parsed content is only `1, 2, 3.`, so ~84 tokens of reasoning
+were decoded into the KV and then stripped by `common_chat` parsing before ever reaching
+`chat_history`. Re-rendering that history cannot reproduce them. qwen3-coder emits no reasoning,
+its assistant content re-templates back to the very tokens it generated, and the prefix holds.
+
+So the two observed behaviours are ONE mechanism, and the model's memory type is a consequence,
+not the cause:
+
+  * every thinking model diverges by `n_gen` tokens each turn and therefore ALWAYS needs a rewind;
+  * on a cuttable positional KV that rewind succeeds and the loss is only the generated tail;
+  * on a Gated Delta Net `seq_rm` refuses, `llama_memory_clear` runs, and the WHOLE prefix dies.
+
+That is also why `llama-server` reuses the same weights fine (id:509): it keeps the decoded token
+sequence as ground truth and appends, so it never re-renders and never asks for a rewind.
+
+**Consequence for the fix.** Making the render byte-stable is not enough on its own, because the
+stripped reasoning tokens are genuinely absent from the history the caller sends back. The engine
+must keep its own decoded token sequence as ground truth, and treat a caller history whose render
+is a prefix of that sequence as an APPEND onto the decoded tokens (reasoning included) rather than
+as a new prompt to diff. The multi-client contract at session.cpp:929-935 survives that: a caller
+history that is NOT such a prefix still replaces the running conversation and re-prefills in full.
+
+**Instrumentation** is in `core/src/engine/session.cpp` behind `BMOE_KV_TRACE` (off by default):
+turn-start, the prefix scan, the post-splice state, and whether `seq_rm` accepted the rewind.
+
+Reproduce with `/tmp/kvdrive.py`-style append-only driver; note DSv4 needs `ds4.service` STOPPED
+first — it holds ~114 GiB of 123 GiB and bmoe-server cannot load the shards alongside it.
 
 ## Acceptance
 

@@ -41,6 +41,14 @@ namespace bmoe {
 
 namespace {
 
+// Opt-in per-turn trace of the prefix match, for telling a short render-instability tail apart
+// from a memory that simply refuses to be cut. Off unless BMOE_KV_TRACE is set, and on stderr
+// because that is where the seq_rm warning below already goes.
+bool kv_trace_on() {
+    static const bool on = std::getenv("BMOE_KV_TRACE") != nullptr;
+    return on;
+}
+
 using clock_t_ = std::chrono::steady_clock;
 double secs(clock_t_::time_point a, clock_t_::time_point b) {
     return std::chrono::duration<double>(b - a).count();
@@ -901,6 +909,10 @@ RunResult Session::generate(const GenerateRequest & req,
         if (im.smpl) llama_sampler_reset(im.smpl);
     }
 
+    if (kv_trace_on())
+        std::fprintf(stderr, "bmoe-kv: turn-start chat_on=%d clear_kv=%d kv_tokens=%zu history=%zu\n",
+                     (int) im.chat_on, (int) req.clear_kv, im.kv_tokens.size(), im.chat_history.size());
+
     // Format the prompt. With chat on, render the model's OWN chat template (real Jinja) over the
     // WHOLE conversation so far, and set up reasoning parsing so a thinking model's internal
     // reasoning is stripped from the shown answer. req.think drives enable_thinking, per prompt.
@@ -1049,6 +1061,9 @@ RunResult Session::generate(const GenerateRequest & req,
         const size_t max_common = tokens.size() > 0 ? tokens.size() - 1 : 0;
         while (n_common < im.kv_tokens.size() && n_common < max_common && im.kv_tokens[n_common] == tokens[n_common])
             ++n_common;
+        if (kv_trace_on())
+            std::fprintf(stderr, "bmoe-kv: prefix n_common=%zu kv_tokens=%zu tokens=%zu tail=%zu\n",
+                         n_common, im.kv_tokens.size(), tokens.size(), im.kv_tokens.size() - n_common);
         // Below this the seq bookkeeping and the extra decode cost more than the block is worth.
         // ponytail: a flat threshold, not a model of the crossover — move it if a profile says so.
         static constexpr size_t kMinSplicedBlock = 256;
@@ -1136,6 +1151,10 @@ RunResult Session::generate(const GenerateRequest & req,
         }
         // Not an else: a splice has already trimmed sequence 0 and left kv_tokens at n_common, so
         // this reads exactly as it did before the splice existed — the prefix-only path.
+        if (kv_trace_on())
+            std::fprintf(stderr, "bmoe-kv: after-splice n_common=%zu kv_tokens=%zu n_block=%zu rewind=%s\n",
+                         n_common, im.kv_tokens.size(), n_block,
+                         n_common < im.kv_tokens.size() ? "yes" : "no");
         if (n_common < im.kv_tokens.size()) {
             // SWA-style and recurrent memory (Gemma's sliding window, a Gated Delta Net state)
             // can refuse a partial removal; fall back to a full re-prefill in that case rather
@@ -1155,6 +1174,8 @@ RunResult Session::generate(const GenerateRequest & req,
                 }
                 llama_memory_clear(llama_get_memory(ctx), true);
                 n_common = 0;
+            } else if (kv_trace_on()) {
+                std::fprintf(stderr, "bmoe-kv: seq_rm accepted the rewind to %zu\n", n_common);
             }
             im.kv_tokens.resize(n_common);
         }
@@ -1621,6 +1642,10 @@ RunResult Session::generate(const GenerateRequest & req,
         if (mtp_on && !llama_memory_seq_rm(llama_get_memory(im.ctx_dft.get()), 0, emitted_end, -1))
             llama_memory_clear(llama_get_memory(im.ctx_dft.get()), true);
     }
+
+    if (kv_trace_on())
+        std::fprintf(stderr, "bmoe-kv: turn-end spec_on=%d kv_tokens=%zu n_prompt=%d n_gen=%d\n",
+                     (int) spec_on, im.kv_tokens.size(), (int) n_prompt, (int) n_gen);
 
     ++im.turn; // this turn is written; label the next one apart
 
