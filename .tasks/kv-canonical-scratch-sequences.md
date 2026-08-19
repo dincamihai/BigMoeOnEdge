@@ -1,6 +1,6 @@
 # Keep reasoning out of the canonical KV: a scratch sequence per turn
 
-column: Todo
+column: Done
 created: 2026-08-19
 
 ## Why
@@ -80,3 +80,41 @@ companion card. Numbers to beat, all from 2026-08-19 on evo:
 * `.tasks/kv-prefix-reuse-recurrent-memory.md` — the diagnosis and the measurements
 * `.tasks/kv-context-budget-with-reasoning.md` — the context-growth question, deliberately separate
 * engram id:509 (llama-server keeps its decoded sequence as ground truth and appends)
+
+## Outcome (2026-08-19)
+
+Implemented and measured on evo. DSv4-Flash WITH thinking, 3 append-only turns:
+
+    turn2  prefix n_common=12  kv_tokens=12  tokens=30  tail=0  rewind=no
+    turn3  prefix n_common=29  kv_tokens=29  tokens=53  tail=0  rewind=no
+    canon commit  keep=0 -> 12 -> 29,  clean=12 -> 29 -> 52,  ok=1
+    prompt_tokens 13 -> 18 -> 24   (was 13 -> 30 -> 53)
+
+No `refuses a partial KV removal` warning is printed: the branch is never entered. qwen3moe is
+unregressed and slightly better — `prompt_tokens 21 -> 12 -> 12` against 21 -> 15 -> 15, `tail=0`,
+warm walls 0.68s/0.62s/0.73s, answers identical. The two-client alternation test passes on BOTH
+models: no leak, and the non-matching history still re-prefills instead of appending onto a
+stranger's turns. ctest 10/10.
+
+THE PART THAT WAS NOT OBVIOUS, and what two failed attempts cost. The canonical tokens are "this
+conversation as a LATER prompt will contain it", and no single render produces that string. First
+attempt rendered `im.chat_history` directly: the template kept the LAST assistant's reasoning, so
+the canonical sequence was 106 tokens against a 30-token prompt — the reasoning went straight back
+in. Clearing `reasoning_content` fixed that and still diverged, because DeepSeek renders a PAST
+assistant as `<|Assistant|></think>text` and the LAST one as `<|Assistant|><think></think>text`.
+Any render ending in this turn's answer is a string no later prompt ever contains.
+
+The fix is to stop modelling the template: render the same history twice with a throwaway message
+appended, differing only in ROLE, and keep the tokens the two renders agree on. They agree through
+the end of the answer and diverge at the next role header — exactly the cut wanted, and it names no
+marker, role or reasoning syntax. Worth defending in review: it looks like a trick, and the two
+obvious direct renders are both wrong.
+
+CARRIED, not done: the split is off when a speculative DRAFT CONTEXT is present (`im.ctx_dft`),
+since that context mirrors sequence 0's positions and would have to be forked in step. With a draft
+context the engine keeps its previous behaviour. n-gram speculation is unaffected (no draft
+context). Worth its own card if MTP is wanted on a thinking model.
+
+One observation, not a defect: at temperature 0 the DSv4 answers now differ slightly from the
+re-prefill run (turn 3 reasoned longer and hit the token cap). The prompt tokens are identical; a
+reused KV is not bit-identical to a recomputed one, and that is true of prefix reuse anywhere.

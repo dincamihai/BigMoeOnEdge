@@ -41,6 +41,16 @@ namespace bmoe {
 
 namespace {
 
+// Said once: a template that cannot render the committed conversation will fail the same way on
+// every turn, and what it costs is a slower next turn rather than a wrong answer.
+void warn_canonical_render_failed_once(const char * what) {
+    static bool said = false;
+    if (!said) {
+        said = true;
+        std::fprintf(stderr, "bmoe: canonical render failed (%s); prefix reuse falls back to a full prefill\n", what);
+    }
+}
+
 // Opt-in per-turn trace of the prefix match, for telling a short render-instability tail apart
 // from a memory that simply refuses to be cut. Off unless BMOE_KV_TRACE is set, and on stderr
 // because that is where the seq_rm warning below already goes.
@@ -61,13 +71,14 @@ double secs(clock_t_::time_point a, clock_t_::time_point b) {
 // verify pass needs logits at EVERY position, not just the last. So every batch on the speculative
 // path is spelled out — including prefill, which the driver must see to keep the draft context's
 // KV in step with the target's.
-void batch_fill(llama_batch & b, const llama_token * toks, int n, llama_pos pos0, bool all_logits) {
+void batch_fill(llama_batch & b, const llama_token * toks, int n, llama_pos pos0, bool all_logits,
+                llama_seq_id seq = 0) {
     b.n_tokens = n;
     for (int i = 0; i < n; ++i) {
         b.token[i] = toks[i];
         b.pos[i] = pos0 + i;
         b.n_seq_id[i] = 1;
-        b.seq_id[i][0] = 0;
+        b.seq_id[i][0] = seq;
         b.logits[i] = (int8_t) (all_logits || i == n - 1);
     }
 }
@@ -308,6 +319,25 @@ struct Session::Impl {
     std::vector<common_chat_msg> chat_history;
     std::vector<llama_token> kv_tokens;
 
+    // Sequence roles. A thinking model decodes its reasoning into the KV and then has it stripped
+    // out before it reaches chat_history, so the next turn's re-render is not an extension of what
+    // was decoded and the engine has to ask for a rewind it may not get — on a recurrent memory,
+    // never. So the conversation and the scratchpad get separate sequences:
+    //
+    //   kSeqCanon  the conversation as the template renders it: prompts and CLEAN answers, which
+    //              is what kv_tokens mirrors. Only ever appended to.
+    //   kSeqWork   a per-turn COPY of the canonical sequence. The turn is prefilled and generated
+    //              here, so the reasoning span dies with the copy instead of becoming a prefix the
+    //              next turn cannot reproduce.
+    //   kSeqPark   the splice's parking bay, for a history edited in the middle (see generate()).
+    //
+    // Copying and whole-sequence removal are the only operations this needs, and neither can be
+    // refused. Nothing is ever cut at a position.
+    static constexpr llama_seq_id kSeqWork  = 0;
+    static constexpr llama_seq_id kSeqPark  = 1;
+    static constexpr llama_seq_id kSeqCanon = 2;
+    bool canon_ready = false; // kSeqCanon holds kv_tokens
+
     // Route trace (diagnostics): null unless requested AND streaming is on — there is no routing
     // to trace otherwise.
     IRouteTraceSink * route_trace = nullptr;
@@ -517,7 +547,7 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     // the splice in generate(). kv_unified is what makes the second sequence free: it keeps
     // n_ctx_seq == n_ctx, where a split cache would hand each sequence half the context for a bay
     // used a handful of times a session.
-    cparams.n_seq_max = 2;
+    cparams.n_seq_max = 3; // work, parking bay, canonical — see Impl's sequence roles
     cparams.kv_unified = true;
     // The graph is reserved for the widest ubatch, so this is what sets the resident compute
     // buffers — the memory this engine is always short of. 0 keeps the historical behaviour
@@ -903,6 +933,7 @@ RunResult Session::generate(const GenerateRequest & req,
         if (im.ctx_dft) llama_memory_clear(llama_get_memory(im.ctx_dft.get()), true);
         im.chat_history.clear();
         im.kv_tokens.clear();
+        im.canon_ready = false;
         // A new chat resets the sampler RNG, so a fixed seed reproduces the same transcript from a
         // fresh conversation. A continued turn (clear_kv=false) keeps the stream going, matching the
         // KV it decodes against.
@@ -921,13 +952,16 @@ RunResult Session::generate(const GenerateRequest & req,
     bool history_pushed = false;   // did we append this turn's user message to chat_history?
     bool prefilled_answer = false; // closed the reasoning span in the prompt, so skip reasoning parse
     common_chat_parser_params parse_params;
+    // Declared out here because the canonical render at the end of the turn renders the same
+    // conversation with the same tool section, and a tool list that differed between the two would
+    // put tokens in the canonical sequence that the next turn's prompt cannot match.
+    std::vector<common_chat_tool> caller_tools;
     if (chat_on) {
         // Parsed before the template block and reported as a failure rather than folded into its
         // fallback: that fallback returns to `req.prompt`, and a caller who sent a conversation has
         // no raw prompt to return to. Silently rendering nothing is how a bad request turns into an
         // empty answer with no reason attached.
         std::vector<common_chat_msg> caller_history;
-        std::vector<common_chat_tool> caller_tools;
         try {
             if (!req.messages_json.empty())
                 caller_history = common_chat_msgs_parse_oaicompat(nlohmann::ordered_json::parse(req.messages_json));
@@ -1048,6 +1082,23 @@ RunResult Session::generate(const GenerateRequest & req,
     // llama-batch.cpp), so the block cannot be left in place with a gap in front of it: it is
     // parked in sequence 1 while the new middle is prefilled into sequence 0, then handed back at
     // its shifted positions. n_block == 0 is the plain prefix path, unchanged.
+    // Whether this turn runs on the canonical/working split. It needs a second sequence to copy
+    // into, and it does NOT cover the speculative draft context: that context mirrors sequence 0's
+    // positions and would have to be forked in step, which is a separate piece of work. With a
+    // draft context present the engine keeps its previous behaviour, where kv_tokens mirrors the
+    // working sequence directly.
+    const bool canon_on = chat_on && im.ctx_dft == nullptr;
+    if (canon_on) {
+        // Last turn left its scratchpad here. Drop it and lay the canonical conversation down in
+        // its place: whole-sequence removal and a copy, neither of which any memory can refuse.
+        llama_memory_seq_rm(llama_get_memory(ctx), Impl::kSeqWork, -1, -1);
+        if (im.canon_ready) {
+            llama_memory_seq_cp(llama_get_memory(ctx), Impl::kSeqCanon, Impl::kSeqWork, -1, -1);
+        } else {
+            im.kv_tokens.clear(); // nothing decoded to match against
+        }
+    }
+
     size_t n_common = 0;
     size_t n_block = 0;      // tokens reused by moving rather than by decoding
     size_t block_at = 0;     // where the moved block starts in the new prompt
@@ -1191,7 +1242,15 @@ RunResult Session::generate(const GenerateRequest & req,
     // Roll this turn back to the state before it started: drop the KV added this turn, forget the
     // tokens we fed, and un-append the user message. Used on cancel so prior turns stay usable.
     auto rollback_turn = [&]() {
-        if (chat_on) {
+        if (canon_on) {
+            // The turn ran in a copy, so undoing it is dropping the copy. The canonical sequence
+            // and kv_tokens were never touched and already describe the conversation as it was.
+            llama_memory_seq_rm(llama_get_memory(ctx), Impl::kSeqWork, -1, -1);
+            if (history_pushed) {
+                im.chat_history.pop_back();
+                history_pushed = false;
+            }
+        } else if (chat_on) {
             if (!llama_memory_seq_rm(llama_get_memory(ctx), 0, (llama_pos) n_common, -1))
                 llama_memory_clear(llama_get_memory(ctx), true);
             im.kv_tokens.resize(n_common);
@@ -1318,7 +1377,11 @@ RunResult Session::generate(const GenerateRequest & req,
     }
     // The prompt is now in the KV in full, however little of it had to be decoded to get there:
     // the reused prefix, the moved block and the freshly prefilled ranges together ARE this list.
-    if (chat_on) im.kv_tokens.assign(tokens.begin(), tokens.end());
+    // Only in the pre-canonical mode: there kv_tokens mirrors the working sequence, so it is the
+    // prompt. With the split, kv_tokens describes the canonical sequence and is written once at the
+    // end of the turn, from the CLEAN render — a prompt carrying a generation-prompt suffix, and a
+    // generated reasoning span, are exactly what must never enter it.
+    if (chat_on && !canon_on) im.kv_tokens.assign(tokens.begin(), tokens.end());
     // A penalty stage (DRY today) decides from what the context already contains, and the only
     // tokens it ever sees are the ones accepted here plus the ones it samples itself. Leave the
     // prompt out and the stage is blind to it: a chat whose history repeats a phrase every turn
@@ -1584,7 +1647,7 @@ RunResult Session::generate(const GenerateRequest & req,
             int np = llama_token_to_piece(im.vocab, out, piece, sizeof(piece), 0, true);
             std::string delta = np > 0 ? std::string(piece, np) : std::string();
             gen += delta;
-            if (chat_on) im.kv_tokens.push_back(out); // this token is now in the KV
+            if (chat_on && !canon_on) im.kv_tokens.push_back(out); // this token is now in the KV
             if (spec_on) mtp_ctx.push_back(out);
             ++n_gen;
 
@@ -1635,6 +1698,7 @@ RunResult Session::generate(const GenerateRequest & req,
             // asserting a prefix the context no longer holds. The next turn re-prefills in full.
             llama_memory_clear(llama_get_memory(ctx), true);
             im.kv_tokens.clear();
+            im.canon_ready = false; // the clear took the canonical sequence with it
         }
         // The draft context mirrors the target's positions (process() decodes the same batches into
         // it), so it is trimmed to the same point — not cleared, or a continued chat turn would
@@ -1662,7 +1726,10 @@ RunResult Session::generate(const GenerateRequest & req,
     // as well as a prefix, and this is the number that has to say so.
     s.n_prompt = 0;
     for (int r = 0; r < n_ranges; ++r) s.n_prompt += ranges[r][1] - ranges[r][0];
-    s.n_past = chat_on ? (int) im.kv_tokens.size() : n_prompt + n_gen; // total context length now
+    // What this turn's working sequence actually holds. Under the canonical/working split
+    // kv_tokens describes the canonical sequence — shorter, since the reasoning span is not in it —
+    // and reporting that here would understate the context the model just ran on.
+    s.n_past = (chat_on && !canon_on) ? (int) im.kv_tokens.size() : n_prompt + n_gen;
     s.load_seconds = im.load_seconds;
     s.prefill_seconds = prefill_seconds;
     s.majflt_per_token = n_gen ? (double) tally.majflt / n_gen : 0.0;
@@ -1774,6 +1841,121 @@ RunResult Session::generate(const GenerateRequest & req,
             assistant.content = gen;
         assistant.role = "assistant";
         im.chat_history.push_back(assistant);
+
+        if (canon_on) {
+            // Commit the CLEAN turn to the canonical sequence: the conversation rendered WITHOUT a
+            // generation prompt, which is by construction the prefix the next turn's prompt opens
+            // with. Everything the model decoded to get here — the reasoning span above all — stays
+            // behind in the working copy and is dropped with it at the top of the next turn.
+            //
+            // This is the extra cost of the split: the new user turn and the answer are decoded a
+            // second time. It buys a prefix the next turn can always match, against a full
+            // re-prefill of the whole conversation every turn if it cannot.
+            std::vector<llama_token> clean;
+            bool rendered = false;
+            try {
+                // The canonical tokens are "this conversation as a LATER prompt will contain it",
+                // and that cannot be got by rendering the history directly. A template renders the
+                // last assistant message differently from a past one — DeepSeek emits
+                // `<|Assistant|><think></think>text` for the last and `<|Assistant|></think>text`
+                // for a past one — so any render whose final message is this turn's answer
+                // produces a string no later prompt ever contains.
+                //
+                // So do not model the template. Render the SAME history twice with a throwaway
+                // message appended, differing in role, and keep the tokens the two agree on. They
+                // agree through the end of the answer and diverge at the next role header, which is
+                // exactly the cut wanted: everything before whatever comes next, whatever that is.
+                // Nothing here knows a marker, a role name, or a reasoning syntax.
+                std::vector<common_chat_msg> clean_history = im.chat_history;
+                // A past assistant turn keeps no reasoning in any template that distinguishes them,
+                // and this turn's answer is about to become a past one.
+                for (common_chat_msg & m : clean_history) m.reasoning_content.clear();
+
+                auto render_with = [&](const char * role) {
+                    std::vector<common_chat_msg> h = clean_history;
+                    common_chat_msg sentinel;
+                    sentinel.role = role;
+                    sentinel.content = "x";
+                    h.push_back(sentinel);
+
+                    common_chat_templates_inputs inputs;
+                    inputs.messages = h;
+                    inputs.tools = caller_tools;
+                    inputs.add_generation_prompt = false;
+                    inputs.use_jinja = true;
+                    inputs.enable_thinking = req.think;
+                    inputs.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+                    const std::string text = common_chat_templates_apply(im.chat_tmpls.get(), inputs).prompt;
+
+                    std::vector<llama_token> out(text.size() + 8);
+                    int nt = llama_tokenize(im.vocab, text.c_str(), (int) text.size(), out.data(),
+                                            (int) out.size(), /*add_special*/ true, /*parse_special*/ true);
+                    if (nt < 0) {
+                        out.resize(-nt);
+                        nt = llama_tokenize(im.vocab, text.c_str(), (int) text.size(), out.data(),
+                                            (int) out.size(), true, true);
+                    }
+                    out.resize(nt > 0 ? (size_t) nt : 0);
+                    return out;
+                };
+
+                const std::vector<llama_token> as_user = render_with("user");
+                const std::vector<llama_token> as_asst = render_with("assistant");
+                size_t agree = 0;
+                while (agree < as_user.size() && agree < as_asst.size() && as_user[agree] == as_asst[agree])
+                    ++agree;
+                if (agree > 0) {
+                    clean.assign(as_user.begin(), as_user.begin() + agree);
+                    rendered = true;
+                }
+            } catch (const std::exception & e) {
+                warn_canonical_render_failed_once(e.what());
+            }
+
+            // Only the growth is decoded. A render that is NOT an extension of what the sequence
+            // holds — a history edited under us, a template whose output moved — cannot be rewound
+            // to on a recurrent memory, so the sequence is dropped and laid down again from zero.
+            size_t keep = 0;
+            bool committed = false;
+            if (rendered) {
+                if (im.canon_ready)
+                    while (keep < im.kv_tokens.size() && keep < clean.size() && im.kv_tokens[keep] == clean[keep])
+                        ++keep;
+                if (keep < im.kv_tokens.size() || !im.canon_ready) {
+                    llama_memory_seq_rm(llama_get_memory(ctx), Impl::kSeqCanon, -1, -1);
+                    keep = 0;
+                }
+                committed = true;
+                if (clean.size() > keep) {
+                    llama_batch cb = llama_batch_init(im.cfg.n_batch, /*embd*/ 0, /*n_seq_max*/ 1);
+                    for (size_t i = keep; i < clean.size(); i += (size_t) im.cfg.n_batch) {
+                        const int chunk = (int) std::min((size_t) im.cfg.n_batch, clean.size() - i);
+                        batch_fill(cb, clean.data() + i, chunk, (llama_pos) i, /*all_logits*/ false,
+                                   Impl::kSeqCanon);
+                        if (llama_decode(ctx, cb) != 0) {
+                            committed = false;
+                            break;
+                        }
+                    }
+                    llama_batch_free(cb);
+                }
+            }
+
+            if (committed) {
+                im.kv_tokens = std::move(clean);
+                im.canon_ready = true;
+            } else {
+                // The answer is already the caller's and is not in question. A canonical sequence
+                // that cannot be trusted costs the NEXT turn a full prefill and nothing else, so
+                // drop it and carry on rather than failing a turn that succeeded.
+                llama_memory_seq_rm(llama_get_memory(ctx), Impl::kSeqCanon, -1, -1);
+                im.kv_tokens.clear();
+                im.canon_ready = false;
+            }
+            if (kv_trace_on())
+                std::fprintf(stderr, "bmoe-kv: canon commit keep=%zu clean=%zu ok=%d\n",
+                             keep, im.kv_tokens.size(), (int) committed);
+        }
     }
     return res;
 }
