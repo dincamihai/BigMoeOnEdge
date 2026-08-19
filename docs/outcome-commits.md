@@ -179,6 +179,32 @@ Three results, and they settle the question:
    described. A lossy summary therefore costs a re-fetch of the whole span, not of the missing
    piece — which is the argument for spending effort on the summary rather than trusting recovery.
 
+**THE CHEAPEST VERSION WINS, and it needs no summariser at all** (measured the same day, Mihai's
+proposal): keep WHAT WAS CALLED AND HOW, drop WHAT CAME BACK. Two further arms:
+
+    calls    tool calls + arguments kept, observations dropped   0 calls, answered correctly
+    strict   same, but final_answer's payload redacted too       2 calls, re-read, then correct
+
+The `calls` arm answers correctly with NO tool calls and NO summary, because `final_answer` is
+itself a tool call and its ARGUMENTS ARE THE ANSWER. So a call ledger retains every outcome
+mechanically, as a side effect of the agent's own protocol, while discarding the bulk. The `strict`
+arm confirms that is where the facts live: redact those arguments and the agent re-reads.
+
+What it saves, measured with realistic ~3.6 kB tool results (the regime `ds4-agent` runs in, which
+clips at 4000 chars): rendered history 12,312 -> 4,706 chars, **62% of the whole prompt and 86% of
+the conversation** once the fixed system prompt is excluded. On two-line toy files the same
+transformation saved 5% — the saving IS the observation size, so measure it on real output or the
+number means nothing.
+
+This is better than a summarised outcome on three counts. It is MECHANICAL, so there is no drafting
+prompt, no second generation, and no possibility of a summary that quietly drops something. It
+preserves outcomes without being asked to. And it keeps the SIDE-EFFECT RECORD: `write_file(path=...,
+content=...)` survives in the ledger, so the agent knows it already happened — precisely the property
+a prose summary endangers.
+
+Take this as the default for agents, and reserve model-written outcomes for chat, where there is no
+`final_answer` call to carry the result and a human is present to check the draft.
+
 WHAT THIS EXPERIMENT DOES NOT COVER, and it is the dangerous part: the only tool was `read_file` —
 cheap, idempotent, safe to repeat. Recovery by re-running `write_file` or `run_shell` is not a cost,
 it is damage. Before B compacts for an agent holding side-effecting tools, either the summariser
