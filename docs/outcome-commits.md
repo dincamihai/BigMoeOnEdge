@@ -74,6 +74,22 @@ Drafting is assisted; committing is not. The model proposes, the human disposes.
 At ~70% of the window, OFFER a commit. Never fire one. The human decides when a span is settled;
 that judgement is the feature.
 
+## The first client, and why
+
+`bmoe-chat.py` — but NOT because it does anything special with the cache. Its append-only,
+feed-the-answer-back-verbatim behaviour (engram id:487, id:489) is what any well-behaved client
+does; the engine performs the prefix diff, and the client's only duty is to avoid rewriting the
+middle. That is a virtue of restraint, not a feature.
+
+What makes it the right first client is that DELIBERATE HISTORY EDITING ALREADY EXISTS THERE.
+`/compress` and `/drop` are edits the user asks for on purpose, and the client already warms the
+KV itself after one, so the next question starts hot — measured at 2701 prefilled tokens dropping
+to 42, 25.6s to 1.0s (engram id:496). `/commit` is that same move with a better-chosen replacement
+text, so it inherits both the command vocabulary and the warming path.
+
+Nothing in this design is bmoe-chat-specific. Any client can implement it; this one has the least
+left to build.
+
 ## Safety: nothing is lost, only moved
 
 The client keeps the FULL RAW TRANSCRIPT on disk. Only the KV holds outcomes. Recovering a
