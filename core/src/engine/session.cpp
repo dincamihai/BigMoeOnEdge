@@ -4,6 +4,7 @@
 #include "bmoe/decode_trace.h"
 #include "bmoe/version.h"
 #include "bmoe/ngram_draft.h"
+#include "canonical_prefix.h"
 #include "chat_parse.h"
 #include "thinking_control.h"
 #include "../moe/router_hook.h"
@@ -1854,58 +1855,23 @@ RunResult Session::generate(const GenerateRequest & req,
             std::vector<llama_token> clean;
             bool rendered = false;
             try {
-                // The canonical tokens are "this conversation as a LATER prompt will contain it",
-                // and that cannot be got by rendering the history directly. A template renders the
-                // last assistant message differently from a past one — DeepSeek emits
-                // `<|Assistant|><think></think>text` for the last and `<|Assistant|></think>text`
-                // for a past one — so any render whose final message is this turn's answer
-                // produces a string no later prompt ever contains.
-                //
-                // So do not model the template. Render the SAME history twice with a throwaway
-                // message appended, differing in role, and keep the tokens the two agree on. They
-                // agree through the end of the answer and diverge at the next role header, which is
-                // exactly the cut wanted: everything before whatever comes next, whatever that is.
-                // Nothing here knows a marker, a role name, or a reasoning syntax.
-                std::vector<common_chat_msg> clean_history = im.chat_history;
-                // A past assistant turn keeps no reasoning in any template that distinguishes them,
-                // and this turn's answer is about to become a past one.
-                for (common_chat_msg & m : clean_history) m.reasoning_content.clear();
-
-                auto render_with = [&](const char * role) {
-                    std::vector<common_chat_msg> h = clean_history;
-                    common_chat_msg sentinel;
-                    sentinel.role = role;
-                    sentinel.content = "x";
-                    h.push_back(sentinel);
-
-                    common_chat_templates_inputs inputs;
-                    inputs.messages = h;
-                    inputs.tools = caller_tools;
-                    inputs.add_generation_prompt = false;
-                    inputs.use_jinja = true;
-                    inputs.enable_thinking = req.think;
-                    inputs.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
-                    const std::string text = common_chat_templates_apply(im.chat_tmpls.get(), inputs).prompt;
-
-                    std::vector<llama_token> out(text.size() + 8);
-                    int nt = llama_tokenize(im.vocab, text.c_str(), (int) text.size(), out.data(),
-                                            (int) out.size(), /*add_special*/ true, /*parse_special*/ true);
-                    if (nt < 0) {
-                        out.resize(-nt);
-                        nt = llama_tokenize(im.vocab, text.c_str(), (int) text.size(), out.data(),
-                                            (int) out.size(), true, true);
-                    }
-                    out.resize(nt > 0 ? (size_t) nt : 0);
-                    return out;
-                };
-
-                const std::vector<llama_token> as_user = render_with("user");
-                const std::vector<llama_token> as_asst = render_with("assistant");
-                size_t agree = 0;
-                while (agree < as_user.size() && agree < as_asst.size() && as_user[agree] == as_asst[agree])
-                    ++agree;
-                if (agree > 0) {
-                    clean.assign(as_user.begin(), as_user.begin() + agree);
+                // "This conversation as a LATER prompt will contain it" — derived in
+                // canonical_prefix.cpp, where it is unit-tested against real templates. The
+                // subtlety that cost two attempts, and then a silent regression, lives there.
+                const std::string text = detail::canonical_prefix_text(im.chat_tmpls.get(),
+                                                                       im.chat_history, caller_tools,
+                                                                       req.think);
+                std::vector<llama_token> out(text.size() + 8);
+                int nt = llama_tokenize(im.vocab, text.c_str(), (int) text.size(), out.data(),
+                                        (int) out.size(), /*add_special*/ true, /*parse_special*/ true);
+                if (nt < 0) {
+                    out.resize(-nt);
+                    nt = llama_tokenize(im.vocab, text.c_str(), (int) text.size(), out.data(),
+                                        (int) out.size(), true, true);
+                }
+                if (nt > 0) {
+                    out.resize(nt);
+                    clean = std::move(out);
                     rendered = true;
                 }
             } catch (const std::exception & e) {

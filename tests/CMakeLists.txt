@@ -30,6 +30,19 @@ target_compile_definitions(bmoe_think_control_test PRIVATE
     BMOE_TMPL_GEMMA4="${_tmpl_dir}/google-gemma-4-31B-it.jinja")
 add_test(NAME think_control COMMAND bmoe_think_control_test)
 
+# Canonical-prefix derivation. Drives bmoe::detail::canonical_prefix_text against real vendored
+# templates, so it needs no model and runs unconditionally. Pins the defect where a sentinel pair
+# that varied by ROLE moved what DeepSeek-V4's template keys reasoning retention on, cutting the
+# answer out of the canonical sequence entirely.
+add_executable(bmoe_canonical_prefix_test canonical_prefix_test.cpp)
+target_link_libraries(bmoe_canonical_prefix_test PRIVATE bmoe_core)
+target_include_directories(bmoe_canonical_prefix_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/engine)
+target_compile_definitions(bmoe_canonical_prefix_test PRIVATE
+    BMOE_TMPL_DEEPSEEK_V4="${_tmpl_dir}/deepseek-ai-DeepSeek-V4.jinja"
+    BMOE_TMPL_GLM46="${_tmpl_dir}/GLM-4.6.jinja"
+    BMOE_TMPL_QWEN3="${_tmpl_dir}/Qwen3.5-4B.jinja")
+add_test(NAME canonical_prefix COMMAND bmoe_canonical_prefix_test)
+
 # validate() unit tests (issue #51 + the pre-existing rules). Pure config, no model — runs
 # unconditionally, and makes good on config.h's "unit-tested" claim.
 add_executable(bmoe_config_test config_test.cpp)
