@@ -147,6 +147,17 @@ not the cause:
 That is also why `llama-server` reuses the same weights fine (id:509): it keeps the decoded token
 sequence as ground truth and appends, so it never re-renders and never asks for a rewind.
 
+**CONTROL RUN, same weights, `--no-think` (2026-08-19).** H1 predicted that removing the
+reasoning span removes the divergence. It does, exactly:
+
+    turn2  prefix n_common=19  kv_tokens=19  tokens=28  tail=0  rewind=no
+    turn3  prefix n_common=38  kv_tokens=38  tokens=47  tail=0  rewind=no
+    prompt_tokens 13 -> 9 -> 9,  wall 5.11s -> 4.41s -> 5.51s
+
+No `refuses a partial KV removal` warning is printed at all — the branch is never entered. So a
+Gated Delta Net memory reuses its prefix perfectly through bmoe. The thinking span is the whole
+of the difference, and id:490's "the model is the variable" is wrong in both of its readings.
+
 **Consequence for the fix.** Making the render byte-stable is not enough on its own, because the
 stripped reasoning tokens are genuinely absent from the history the caller sends back. The engine
 must keep its own decoded token sequence as ground truth, and treat a caller history whose render
