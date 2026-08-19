@@ -70,13 +70,57 @@ is closer to "what happens when a turn cannot finish" than to a budgeting policy
 
 ## What is actually open
 
-1. **Long conversations still end.** Sequence 0 grows at the clean rate, which is slow, but it is
-   not bounded. When it approaches `n_ctx` something must give. The shape that fits the append-only
-   constraint is a periodic reset: ONE full re-prefill from a trimmed history, paying a single slow
-   turn to recover room, rather than a continuous trim which a recurrent memory cannot do at all.
-   Decide the trigger (a fraction of `n_ctx`) and what gets dropped.
-2. **Nothing measures this yet.** There is no number for how many turns of real DSv4 use fit in a
-   given `-c`. Get one before designing the reset, or the threshold is a guess.
+MEASURED 2026-08-19 (see "The numbers" below), which closes item 2 and reshapes item 1.
+
+1. **Long conversations end by being REFUSED, not by breaking.** The window is enforced by an
+   admission check before any decoding: `prompt + n_predict > n_ctx` returns HTTP 500 with
+   "prompt + n_predict exceeds the session n_ctx (N); open the session with a larger n_ctx",
+   in 0.0s, before work starts. No silent truncation, no confident wrong answer, no crash.
+   So a reset is a USABILITY feature, not a correctness requirement — which lowers this card's
+   priority but does not remove it.
+   What still has to be decided is the trigger (a fraction of `n_ctx`) and the drop set. For the
+   drop set see the retraction-driven proposal in engram id:516: drop turns that are SUPERSEDED
+   rather than turns that are OLD.
+2. ~~Nothing measures this yet.~~ DONE — numbers below.
+
+## The numbers (2026-08-19, DSv4-Flash on evo, after the id:515 sentinel fix)
+
+Substantive Q&A, one question per turn, answers fed back verbatim:
+
+    turn   n_gen   canonical   prefilled
+     1      159     32 ->  66     32
+     2      456     66 -> 365     21
+     3     2048     (empty)       24
+     4      965        -> 479    384
+     5      571    479 -> 683     18
+     6     2048     (empty)       22
+     7     1479       -> 830    707
+
+* Canonical grows about **120 net tokens per turn** on this workload.
+* `n_gen` ran **159-2048**, and **2 of 7** substantive turns spent the WHOLE 2048-token cap on
+  reasoning and returned NO CONTENT AT ALL. That is the in-turn pressure, and it is the failure
+  users meet first — long before any refusal.
+* Peak is `canonical + n_gen`, so turns-per-context is roughly `(n_ctx - max n_gen) / 120`:
+  ~17 turns at `-c 4096`, ~250 at evo's usual `-c 32768`. But a SINGLE turn can still exhaust
+  the window on its own, which is the real risk and is independent of conversation length.
+* The 384- and 707-token prefills on turns 4 and 7 are a discarded turn being dropped from the
+  history: a history that is not an extension of canonical rebuilds it from zero. An accidental
+  but faithful measurement of what an interior history edit costs.
+
+### How to measure this cheaply, because the obvious way is wrong
+
+The first attempt drove real questions at `-c 4096` and would have taken over an hour, because it
+waited on the MODEL when the subject is the WINDOW. Take the model out of the loop instead:
+
+* Shrink `n_ctx` (`-c 1024`) so the wall arrives on turn 2 or 3 rather than turn 15.
+* Set `max_tokens` to 4 and grow the prompt with known-size filler, so each turn costs seconds and
+  canonical growth is exact arithmetic rather than hostage to how long the model reasons.
+
+Same event, about 50x cheaper. Probe kept at `/tmp/kvwall.py` (throwaway).
+
+Trap for whoever writes the next driver: do NOT substitute placeholder text when the model returns
+an empty answer. Feeding back an assistant message the model never produced diverges the history
+from canonical and forces a full re-prefill — it looks exactly like an engine bug (engram id:489).
 
 ## Related
 

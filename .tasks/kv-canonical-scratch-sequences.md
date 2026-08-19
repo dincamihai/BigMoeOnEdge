@@ -118,3 +118,43 @@ context). Worth its own card if MTP is wanted on a thinking model.
 One observation, not a defect: at temperature 0 the DSv4 answers now differ slightly from the
 re-prefill run (turn 3 reasoned longer and hit the token cap). The prompt tokens are identical; a
 reused KV is not bit-identical to a recomputed one, and that is true of prefix reuse anywhere.
+
+## Correction (2026-08-19): it shipped half-broken, and the fix for that is the sentinel pair
+
+The split above landed, but the canonical sequence NEVER HELD THE ANSWER. Every turn committed the
+conversation only as far as the user message; the answer arrived a turn late, out of the caller's
+history. An 889-token prompt reused 29 tokens.
+
+The cause is the trick this card calls the part that was not obvious. Varying the sentinel's ROLE
+assumes a role change moves only where the two renders diverge. It does not. DeepSeek-V4 computes
+`last_user_idx` and sets
+
+    keep_reasoning = tp.has or (loop.index0 > last_user_idx.value)
+
+so a USER sentinel puts the answer BEFORE the last user message (reasoning stripped, `</think>x`)
+while an ASSISTANT sentinel leaves it after (reasoning kept, `<think></think>x`). The renders
+disagree at the answer's own header, every turn — the same last-vs-past asymmetry this card was
+written to survive, re-entered through the fix for it.
+
+Fix: hold the ROLE fixed and vary only the CONTENT. Whatever the template keys on is then identical
+in both renders, which can only diverge inside the sentinel itself. Commit
+"fix(engine): vary the canonical sentinel's content, not its role"; derivation extracted to
+`core/src/engine/canonical_prefix.{h,cpp}` and unit-tested against vendored templates.
+
+NOT DeepSeek-specific — rendered offline from the vendored templates, the old cut kept 44 chars on
+DeepSeek-V4, stopped short of the answer on Qwen3.5, and kept 22 chars on GLM-4.6 and 10 on
+MiniMax-M2, both still inside the preamble. On those two the split was INERT.
+
+Measured before -> after, same 3 turns: canonical 17/26/35 -> 21/30/39, prefilled 18/10/10 -> 18/6/6.
+
+WHY THE VALIDATION IN THIS CARD MISSED IT, which is the lesson worth keeping: every assertion was
+about prefix reuse working, and reuse DID work — `tail=0`, no refusal, prompt_tokens 13->18->24.
+A canonical that stops before the answer is still a valid prefix; it just makes the next turn
+re-prefill the answer, which is invisible when answers are 4 tokens long. The new test asserts the
+answer is IN the canonical text, and that assertion is the whole test. It was itself vacuous on
+first writing (the oracle's answer string also occurred in the question) and passed against the
+broken code until the answer was changed to something the prompt could not contain.
+
+ALSO: ctest is no longer 10/10 as recorded above — `G15 ... the block was not moved` fails on clean
+HEAD (verified by stashing; identical numbers 1101/1105 and 1174/1178). Unrelated to this work,
+regressed some time after this card was written.

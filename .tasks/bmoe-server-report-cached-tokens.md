@@ -52,3 +52,23 @@ Retiring the bridge in favour of the native server currently means losing that.
 * `.tasks/kv-canonical-scratch-sequences.md` — the reuse this is supposed to make visible
 * engram id:489 (reuse was assumed and was not happening; the meter is what caught it)
 * engram id:488 (the bridge's llama-server-shaped usage block, as patched)
+
+## Correction (2026-08-19): `prompt_tokens` is MISLABELLED, not missing
+
+Measured while chasing the canonical-commit defect: the server's `prompt_tokens` does not report the
+prompt at all, it reports the tokens actually PREFILLED. A turn whose trace read
+`n_prompt=27 n_common=21` was reported to the client as `prompt_tokens=6`, and a turn that reused 29
+of 30 tokens was reported as `prompt_tokens=1`.
+
+So the reuse meter is already there, wearing the wrong name — and it is wrong in the direction that
+hides the problem: a client watching `prompt_tokens` sees a number that FALLS as reuse improves and
+cannot tell that apart from a shorter prompt. Two things to fix together:
+
+* `prompt_tokens` should be the whole prompt (OpenAI semantics), and
+* `prompt_tokens_details.cached_tokens` should carry `n_common`, which is the number this field is
+  currently standing in for.
+
+Separately, `finish_reason` is `stop` on turns that hit the `max_tokens` cap; it should be `length`.
+Confirmed deliberately: a request for exactly 900 tokens generated 900 and still reported `stop`.
+This matters more than it looks on a thinking model, where hitting the cap is how an answer comes
+back EMPTY (the whole cap spent on reasoning) — and `stop` tells the client that was a normal end.
