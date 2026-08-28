@@ -20,6 +20,14 @@ Semantic Versioning.
   llama.cpp's own `common_json`.
 
 ### Fixed
+- **A model that calls a tool no longer aborts the process.** `to_json_oaicompat()` returns
+  llama.cpp's own `common_json`, and assigning it to an `nlohmann::ordered_json` COMPILES: both
+  types convert freely, so the compiler reached for `common_json::operator std::string()` and asked
+  an object for its string value. That throws, on the line that serialises the answer, outside any
+  catch -- so the turn succeeded and the process died with SIGABRT while writing the reply. It
+  fired only when a model actually emitted a tool call, which is why it survived every test that
+  did not; a coding agent hit it within the hour. The conversion now names `common_json`, and
+  session.cpp no longer includes nlohmann at all, so the same silent conversion cannot come back.
 - **A long-context session no longer reserves a graph as wide as its window.** `n_batch` followed
   `n_ctx` — "one-batch prefill for any prompt that fits the context" — and `n_ubatch` followed
   `n_batch`, so opening a session at a large context reserved compute buffers for a full-width

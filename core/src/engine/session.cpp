@@ -20,7 +20,6 @@
 #include "chat.h"
 #include "common.h"
 // chat.h forward-declares the json type; the OpenAI converters are used here with real values.
-#include "nlohmann/json.hpp"
 #include "speculative.h"
 
 #include <algorithm>
@@ -1834,7 +1833,13 @@ RunResult Session::generate(const GenerateRequest & req,
         // ids, the `function` wrapper and the arguments-as-string convention are its rules, and a
         // second implementation of them would drift the first time a template family changed.
         if (!final_msg.tool_calls.empty()) {
-            const nlohmann::ordered_json j = final_msg.to_json_oaicompat();
+            // common_json, NOT nlohmann::ordered_json. to_json_oaicompat returns the former, and
+            // assigning it to the latter compiles: both types have permissive conversions, so the
+            // compiler reaches for common_json::operator std::string() and asks an OBJECT for its
+            // string value. That throws at runtime, here, outside any catch -- the turn had already
+            // succeeded and the process aborted while serialising its answer. It fired only when a
+            // model actually called a tool, which is why it survived every test that did not.
+            const common_json j = final_msg.to_json_oaicompat();
             if (j.contains("tool_calls")) res.tool_calls_json = j.at("tool_calls").dump();
         }
     } else {
