@@ -319,6 +319,13 @@ struct Session::Impl {
     // and prefill only the diverging suffix instead of re-running the whole conversation.
     std::vector<common_chat_msg> chat_history;
     std::vector<llama_token> kv_tokens;
+    // What kSeqCanon actually holds. It starts each turn equal to kv_tokens, but the splice below
+    // trims kv_tokens to describe the WORKING sequence it just rewound — and the canonical sequence
+    // is not touched by that. Sharing one vector made the commit read the working sequence's length
+    // when deciding whether the canonical one had to be cleared, so after a splice it appended at a
+    // position the canonical sequence already held. That is rejected outright by the batch
+    // allocator, and the whole canonical sequence was dropped one turn later.
+    std::vector<llama_token> canon_tokens;
 
     // Sequence roles. A thinking model decodes its reasoning into the KV and then has it stripped
     // out before it reaches chat_history, so the next turn's re-render is not an extension of what
@@ -938,6 +945,7 @@ RunResult Session::generate(const GenerateRequest & req,
         if (im.ctx_dft) llama_memory_clear(llama_get_memory(im.ctx_dft.get()), true);
         im.chat_history.clear();
         im.kv_tokens.clear();
+        im.canon_tokens.clear();
         im.canon_ready = false;
         // A new chat resets the sampler RNG, so a fixed seed reproduces the same transcript from a
         // fresh conversation. A continued turn (clear_kv=false) keeps the stream going, matching the
@@ -1102,6 +1110,9 @@ RunResult Session::generate(const GenerateRequest & req,
         llama_memory_seq_rm(llama_get_memory(ctx), Impl::kSeqWork, -1, -1);
         if (im.canon_ready) {
             llama_memory_seq_cp(llama_get_memory(ctx), Impl::kSeqCanon, Impl::kSeqWork, -1, -1);
+            // Sequence 0 is now that copy, so the mirror the prefix match and the splice read has to
+            // be the canonical one again — last turn's splice may have left kv_tokens trimmed.
+            im.kv_tokens = im.canon_tokens;
         } else {
             im.kv_tokens.clear(); // nothing decoded to match against
         }
@@ -1706,6 +1717,7 @@ RunResult Session::generate(const GenerateRequest & req,
             // asserting a prefix the context no longer holds. The next turn re-prefills in full.
             llama_memory_clear(llama_get_memory(ctx), true);
             im.kv_tokens.clear();
+            im.canon_tokens.clear();
             im.canon_ready = false; // the clear took the canonical sequence with it
         }
         // The draft context mirrors the target's positions (process() decodes the same batches into
@@ -1861,6 +1873,7 @@ RunResult Session::generate(const GenerateRequest & req,
             // re-prefill of the whole conversation every turn if it cannot.
             std::vector<llama_token> clean;
             bool rendered = false;
+            size_t n_clean = 0;
             try {
                 // "This conversation as a LATER prompt will contain it" — derived in
                 // canonical_prefix.cpp, where it is unit-tested against real templates. The
@@ -1879,6 +1892,7 @@ RunResult Session::generate(const GenerateRequest & req,
                 if (nt > 0) {
                     out.resize(nt);
                     clean = std::move(out);
+                    n_clean = clean.size();
                     rendered = true;
                 }
             } catch (const std::exception & e) {
@@ -1892,9 +1906,10 @@ RunResult Session::generate(const GenerateRequest & req,
             bool committed = false;
             if (rendered) {
                 if (im.canon_ready)
-                    while (keep < im.kv_tokens.size() && keep < clean.size() && im.kv_tokens[keep] == clean[keep])
+                    while (keep < im.canon_tokens.size() && keep < clean.size() &&
+                           im.canon_tokens[keep] == clean[keep])
                         ++keep;
-                if (keep < im.kv_tokens.size() || !im.canon_ready) {
+                if (keep < im.canon_tokens.size() || !im.canon_ready) {
                     llama_memory_seq_rm(llama_get_memory(ctx), Impl::kSeqCanon, -1, -1);
                     keep = 0;
                 }
@@ -1915,19 +1930,21 @@ RunResult Session::generate(const GenerateRequest & req,
             }
 
             if (committed) {
-                im.kv_tokens = std::move(clean);
+                im.canon_tokens = std::move(clean);
+                im.kv_tokens = im.canon_tokens;
                 im.canon_ready = true;
             } else {
                 // The answer is already the caller's and is not in question. A canonical sequence
                 // that cannot be trusted costs the NEXT turn a full prefill and nothing else, so
                 // drop it and carry on rather than failing a turn that succeeded.
                 llama_memory_seq_rm(llama_get_memory(ctx), Impl::kSeqCanon, -1, -1);
+                im.canon_tokens.clear();
                 im.kv_tokens.clear();
                 im.canon_ready = false;
             }
             if (kv_trace_on())
-                std::fprintf(stderr, "bmoe-kv: canon commit keep=%zu clean=%zu ok=%d\n",
-                             keep, im.kv_tokens.size(), (int) committed);
+                std::fprintf(stderr, "bmoe-kv: canon commit keep=%zu clean=%zu canon=%zu ok=%d\n",
+                             keep, n_clean, im.canon_tokens.size(), (int) committed);
         }
     }
     return res;

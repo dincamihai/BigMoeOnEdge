@@ -710,7 +710,12 @@ int main(int argc, char ** argv) {
         SessionConfig sc;
         sc.model_path = model;
         sc.n_threads = 2;
-        sc.n_ctx = 2048;
+        // 2048 cells is not enough for this conversation: the canonical/working split needs the
+        // conversation resident TWICE — once as kSeqCanon, once as the per-turn copy generated into
+        // — and the unified cache counts those cells once each. Under-sized, the canonical commit
+        // fails from turn one, the engine correctly falls back to a full prefill, and what this gate
+        // asserts can never happen for a reason that has nothing to do with the splice.
+        sc.n_ctx = 8192;
         sc.n_batch = 512;
         sc.chatml = true;
         std::unique_ptr<Session> s = Session::open(sc, err);

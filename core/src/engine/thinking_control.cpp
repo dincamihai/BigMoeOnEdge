@@ -1,5 +1,6 @@
 #include "thinking_control.h"
 
+#include <cctype>
 #include <cstdio>
 #include <exception>
 #include <string>
@@ -74,26 +75,42 @@ ThinkControl probe_think_control(const common_chat_templates * tmpls) {
         // `<think>` they never emit. Requiring the template to actually USE it is the same test
         // llama.cpp applies before wiring up reasoning extraction for that family.
         const std::string src = common_chat_templates_source(tmpls);
-        const bool owns_span =
+        const bool declares_span =
             !off_p.thinking_start_tag.empty() && src.find(off_p.thinking_start_tag) != std::string::npos;
 
-        // It does, and the flag is inert: the request cannot be honoured. Closing the span in the
-        // prompt is only a suggestion to a model that opens its own — LFM2.5 reasons straight past a
-        // pre-closed empty one and emits the reasoning untagged into the answer (issue #82), worse
-        // than leaving it alone. Say so instead of making it worse.
-        if (owns_span) return ThinkControl::None;
+        // Nothing indicates this model reasons at all: a tag its family publishes but this template
+        // never emits. There is nothing to suppress, so pass the flag and add nothing — claiming it
+        // "always reasons" would be a louder lie than the silence this probe exists to end.
+        if (!declares_span) return ThinkControl::Template;
 
         const std::string prefilled = apply_probe(tmpls, /*enable_thinking=*/false, /*prefill=*/true).prompt;
 
-        // No span of its own, and the prefill lands: reasoning is structural — a channel the format
-        // itself separates — so starting the turn past that section is not something the model can
-        // decline (harmony/gpt-oss).
-        if (prefilled != off && off_p.thinking_start_tag.empty()) return ThinkControl::Prefill;
+        // The prefill changes nothing, so there is no lever at all.
+        if (prefilled == off) return ThinkControl::None;
 
-        // Nothing indicates this model reasons at all: no span it uses, no reasoning section to start
-        // past. There is nothing to suppress, so pass the flag and add nothing — claiming it "always
-        // reasons" would be a louder lie than the silence this probe exists to end.
-        return ThinkControl::Template;
+        // Where did the prefill LEAVE the model? Asking that, rather than whether a start tag was
+        // published, is what tells the two regimes apart — and it stays true across a submodule bump,
+        // because it reads the rendered prompt instead of a field whose population is upstream's
+        // choice. Harmony used to publish no start tag and now publishes one; nothing about either
+        // model changed.
+        //
+        //   ends ON the closing tag  — the span is merely CLOSED, and closing it is a suggestion to
+        //                              a model that opens its own: LFM2.5 reasons straight past a
+        //                              pre-closed empty span and emits it untagged into the answer
+        //                              (issue #82), worse than leaving it alone.
+        //   ends PAST it             — the prompt has moved into a later section the format itself
+        //                              separates, so the skipped one is not something the model can
+        //                              decline (harmony/gpt-oss ends on `<|channel|>final<|message|>`).
+        auto ends_with = [](const std::string & s, const std::string & suffix) {
+            return !suffix.empty() && s.size() >= suffix.size() &&
+                   s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+        };
+        std::string tail = prefilled;
+        while (!tail.empty() && std::isspace((unsigned char) tail.back())) tail.pop_back();
+        for (const std::string & end_tag : off_p.thinking_end_tags) {
+            if (ends_with(tail, end_tag)) return ThinkControl::None;
+        }
+        return ThinkControl::Prefill;
     } catch (const std::exception & e) {
         std::fprintf(stderr, "bmoe: thinking-control probe failed (%s); assuming the template honours it\n", e.what());
         return ThinkControl::Template;

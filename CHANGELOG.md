@@ -20,6 +20,26 @@ Semantic Versioning.
   llama.cpp's own `common_json`.
 
 ### Fixed
+- **A spliced history no longer costs the next turn its whole prefix.** `kv_tokens` served two
+  masters: at commit time it mirrored the canonical sequence, but the splice rewrote it to describe
+  the working sequence it had just rewound. On the plain path the two agree, so this was invisible;
+  after a history edit they diverge, and the commit's guard — whose only job is deciding whether the
+  canonical sequence must be cleared before it is laid down again — read the working sequence's
+  length. It then appended at a position the canonical sequence already held, which the batch
+  allocator rejects outright, and the whole canonical sequence was dropped. The turn that spliced
+  looked fine; the one after it re-prefilled the entire conversation. The canonical sequence now has
+  its own mirror. Measured on the `qwen3moe` fixture: a 1105-token edited turn prefills 5 tokens,
+  and the turn after it 73 of 1178, where both re-prefilled in full before.
+- **Thinking control reports gpt-oss correctly again.** The probe told a model that owns its
+  reasoning span apart from one whose reasoning is a structural channel by asking whether the
+  handler published a start tag — harmony published none, so it fell through to the prefill regime.
+  It publishes one now, and nothing about either model changed: the probe was reading a field whose
+  population is the base's choice. It now asks where the prefill LEFT the model, which is the
+  question it actually cared about. A prompt that ends ON the closing tag has merely had its span
+  closed, and a model that opens its own reasons straight past it; one that ends PAST the tag has
+  moved into a later section the format itself separates, which the model cannot decline. Both
+  answers come from the rendered prompt and the model-supplied `thinking_end_tags`, so the engine
+  still names no marker for any family.
 - **The HTTP chat route no longer throws away the KV on every turn.** `/v1/chat/completions`
   hardcoded `clear_kv = true`, so a phone answering an OpenAI client re-prefilled the entire
   conversation on every question — the slowest phase of a turn, paid in full, forever. It cannot
