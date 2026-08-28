@@ -6,6 +6,19 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+- **Qwen3.8-Flash-Next (`qwen4exp`) streams.** The arch is a hybrid stack carrying more dense-side
+  machinery than any other in the registry — a per-layer indexer, a hypernetwork-style injection
+  path and PLE tensors — but none of it touches the streaming seam: it is resident dense weight on
+  the llama.cpp side, exactly like DeepSeek V4's lightning indexer. Its routed experts name the
+  standard `ffn_{gate,up,down}_exps` suffixes, so the recipe is one row. The always-on shared
+  expert stays mmap-resident and lowers the streamed fraction the same way it does for `qwen35moe`.
+  The arch string in the gguf is `qwen4exp`, not `qwen3next`. Loading it needs a llama.cpp base
+  that carries the architecture; three API changes between an older base and that one are absorbed
+  in `session.cpp` — the `use_mmap` flag became a `load_mode` enum, `llama_sampler_init_dry` lost
+  its `n_ctx_train` argument, and the OpenAI message/tool converters moved off `nlohmann` onto
+  llama.cpp's own `common_json`.
+
 ### Fixed
 - **The HTTP chat route no longer throws away the KV on every turn.** `/v1/chat/completions`
   hardcoded `clear_kv = true`, so a phone answering an OpenAI client re-prefilled the entire

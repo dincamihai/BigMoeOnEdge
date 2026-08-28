@@ -452,7 +452,9 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     // Load with the layout the streamer requires: file-backed mmap, no repack (a repacked
     // q4_K buffer would break the rebind), experts on CPU.
     llama_model_params mparams = llama_model_default_params();
-    mparams.use_mmap = true;
+    // Upstream replaced the use_mmap bool with an explicit load_mode enum between this
+    // submodule's old base (2026-07-10) and the qwen4exp branch's base (2026-08-26).
+    mparams.load_mode = LLAMA_LOAD_MODE_MMAP;
     mparams.use_extra_bufts = false;
     mparams.n_gpu_layers = 0;
 
@@ -609,7 +611,9 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
         if (cfg.sampling.dry_multiplier > 0.0f) {
             static const char * kDrySeqBreakers[] = {"\n", ":", "\"", "*"};
             llama_sampler_chain_add(
-                im.smpl, llama_sampler_init_dry(llama_model_get_vocab(model), llama_model_n_ctx_train(model),
+                // The n_ctx_train argument was dropped from this constructor upstream in the
+                // same window as the load_mode change; the sampler reads it from the vocab now.
+                im.smpl, llama_sampler_init_dry(llama_model_get_vocab(model),
                                                 cfg.sampling.dry_multiplier, cfg.sampling.dry_base,
                                                 cfg.sampling.dry_allowed_length, /*dry_penalty_last_n*/ -1,
                                                 kDrySeqBreakers, sizeof(kDrySeqBreakers) / sizeof(kDrySeqBreakers[0])));
@@ -964,10 +968,13 @@ RunResult Session::generate(const GenerateRequest & req,
         // empty answer with no reason attached.
         std::vector<common_chat_msg> caller_history;
         try {
+            // Upstream moved these two off nlohmann and onto its own common_json between this
+            // submodule's old base and the qwen4exp branch's. common_json::parse throws the
+            // same way, so the surrounding catch still reports a bad request as a failure.
             if (!req.messages_json.empty())
-                caller_history = common_chat_msgs_parse_oaicompat(nlohmann::ordered_json::parse(req.messages_json));
+                caller_history = common_chat_msgs_parse_oaicompat(common_json::parse(req.messages_json));
             if (!req.tools_json.empty())
-                caller_tools = common_chat_tools_parse_oaicompat(nlohmann::ordered_json::parse(req.tools_json));
+                caller_tools = common_chat_tools_parse_oaicompat(common_json::parse(req.tools_json));
         } catch (const std::exception & e) {
             return fail(std::string("bad request: ") + e.what());
         }

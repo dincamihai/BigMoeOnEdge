@@ -49,6 +49,18 @@ static const MoeRecipe k_recipes[] = {
     // inside llama.cpp and invisible to the streaming seam. Models this size ship as multi-shard
     // ggufs; the streamer resolves each expert tensor to its (shard, offset) — see gguf_offsets.
     {"deepseek4", {"ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"}},
+    // qwen4exp (Qwen3.8-Flash-Next) is a hybrid stack like qwen35moe, carrying more dense-side
+    // machinery than any arch above: a per-layer indexer (indexer.{q,k}_{proj,norm}), a
+    // hypernetwork-style injection path (hc_attn_*, hc_ffn_*) and PLE tensors (ple_conv1d,
+    // ple_key). None of it touches the streaming seam — it is resident dense weight on the
+    // llama.cpp side, exactly like DeepSeek V4's lightning indexer. The routed experts name the
+    // standard split suffixes, so streaming is one row. There is also an always-on shared expert
+    // (ffn_*_shexp) matching no suffix, which stays mmap-resident and lowers the streamed
+    // fraction the same way it does for qwen35moe and deepseek4.
+    //
+    // The arch string is "qwen4exp", NOT "qwen3next": that is what the gguf carries, and it
+    // loads only on unsloth's qwen4exp/qwen3.8-flash-next branch, not on upstream llama.cpp.
+    {"qwen4exp", {"ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"}},
 };
 
 static const int k_n_recipes = (int) (sizeof(k_recipes) / sizeof(k_recipes[0]));
