@@ -19,15 +19,24 @@
 
 #include "bmoe/config.h"
 
+#include <functional>
+#include <vector>
+
+#include <cstdint>
 #include <memory>
 #include <string>
 
 struct llama_model;
+struct llama_context_params;
 struct llama_context;
 struct llama_model_params;
 struct llama_context_params;
 
 namespace bmoe {
+
+class RouterHook;
+class ExpertStreamSource;
+struct GgufMeta;
 
 class ExpertStreamHost {
 public:
@@ -45,6 +54,35 @@ public:
     // cb_eval afterwards; there is one callback slot and the streamer needs it.
     void configure(llama_context_params & cparams);
 
+    // Stream more layers than the model reports. A speculative MTP head sits at layer index
+    // n_layer and routes experts of its own: left out, they stay mmap-resident, which is the one
+    // thing streaming exists to avoid on a model that does not fit. Call before attach().
+    void set_extra_layers(int n);
+
+    // The router, for a host that tunes it before attach() -- drop policy, prediction, tracing.
+    RouterHook & hook();
+
+    // The streamer itself, for the diagnostics and knobs a host may drive after attach().
+    ExpertStreamSource & source();
+
+    // What the capture concluded: experts per tensor, and the streamed span it harvested over.
+    int n_expert() const;
+    int n_layer_streamed() const;
+
+    // Per-layer dense byte totals, for a host that reports them. Empty unless requested before
+    // attach(), because computing it means walking the gguf a second time.
+    void want_dense_bytes(bool on);
+    const std::vector<uint64_t> & dense_bytes_per_layer() const;
+
+    // The gguf metadata the attach read, so a caller does not parse the file a third time.
+    const GgufMeta & meta() const;
+
+    // A capture decode the host runs itself, for the graph the helper cannot build: MTP's expert
+    // layer is only reached through the draft context, so a speculative host must issue that pass.
+    // Return false to fail the attach. Default: one BOS decode on the given context.
+    using CaptureFn = std::function<bool(llama_context *)>;
+    void set_capture(CaptureFn fn);
+
     // Runs one capture decode on the given context, harvests the expert tensors it saw, opens the
     // gguf shards and rebinds. The KV is cleared afterwards, so the host starts from a clean cache.
     // Returns false and fills `err` on any failure; the caller may then carry on unstreamed.
@@ -52,6 +90,11 @@ public:
 
     // False until attach() has succeeded.
     bool attached() const;
+
+    // Bytes the dense-weights policy read into private buffers and rebound. Zero under the mmap
+    // policies, and zero before attach(). A host can check this to tell a policy that ran from one
+    // that silently degraded to mmap because nothing handed it the tensors.
+    uint64_t dense_rebound_bytes() const;
 
 private:
     struct Impl;

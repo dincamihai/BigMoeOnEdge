@@ -135,13 +135,21 @@ static int32_t * id_at(ggml_tensor * t, int j, int k) {
 }
 
 void RouterHook::set_recipe(const MoeRecipe & recipe, int n_layer) {
-    // Same work the constructor does, so the two entry points cannot drift: a host that could not
-    // know the architecture yet ends up in exactly the state one that could would have been in.
     recipe_  = recipe;
     n_layer_ = n_layer;
     const int n = n_layer_ > 0 ? n_layer_ : 0;
     captured_.assign(n, LayerExperts{});
     prev_ids_.assign(n, std::vector<int32_t>{});
+    // The constructor is not the only thing that sizes per-layer state: three setters own vectors
+    // of their own and size them from n_layer_ as it stood when they were called. A host that
+    // configures the router before the architecture is known calls them while n_layer_ is still
+    // zero, and on the first real decode on_eval indexes a vector of length zero. So they are
+    // re-run here with the parameters they already hold, and the object ends up in the same state
+    // whichever order the caller used. This is what "the two entry points cannot drift" has to
+    // mean; asserting it in a comment was not enough, and the MoE gates caught it as a segfault.
+    set_drop_policy(drop_frac_, drop_renorm_, drop_prefill_);
+    set_route_ahead(route_ahead_);
+    predict_reset();
 }
 
 void RouterHook::begin_capture() {

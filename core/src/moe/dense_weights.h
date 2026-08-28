@@ -69,6 +69,11 @@ public:
     void sample_residency(size_t page);
     double resident_frac() const { return resident_frac_; }
 
+    // Bytes actually read into private buffers and rebound. Zero for Mmap/Warmed, which leave the
+    // weights where they are. The number was computed and printed to stderr and then dropped; a
+    // caller that wants to know whether the policy did anything had no way to ask.
+    uint64_t rebound_bytes() const { return rebound_bytes_; }
+
     void shutdown();
 
     static constexpr int sample_pages = 256; // stratified probe points across the dense bytes
@@ -94,6 +99,7 @@ private:
     std::vector<std::unique_ptr<FileReader>> readers_;
     std::vector<DenseTensorRef> tensors_;
     std::vector<void *> bases_;
+    uint64_t rebound_bytes_ = 0;
     std::vector<void *> bufs_;
     std::vector<pio::PinnedAlloc> pinned_;
     std::vector<size_t> buf_sz_;

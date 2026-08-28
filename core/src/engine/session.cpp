@@ -10,6 +10,7 @@
 #include "../moe/router_hook.h"
 #include "../moe/expert_stream_source.h"
 #include "../moe/gguf_offsets.h"
+#include "bmoe/expert_stream_host.h"
 #include "../io/platform_io.h"
 
 #include "llama.h"
@@ -211,36 +212,6 @@ struct GenTally {
     }
 };
 
-// The names of the expert weight tensors the streamer rebinds. "Dense" is defined by subtraction —
-// everything the model has that is NOT one of these — so both consumers below start by asking this
-// same question, and used to answer it with their own copy of the same triple loop.
-std::unordered_set<std::string> expert_tensor_names(const std::vector<LayerExperts> & layers) {
-    std::unordered_set<std::string> names;
-    for (const LayerExperts & L : layers) {
-        if (!L.bound) continue;
-        for (int p = 0; p < MoeRecipe::max_exps; ++p)
-            if (L.proj[p].tensor) names.insert(L.proj[p].tensor->name);
-    }
-    return names;
-}
-
-// Each layer's bytes that the streamer does NOT manage: everything under blk.<il>. except the
-// expert weight tensors it rebinds — attention, norms, the router, and any per-expert scale left
-// mmap-resident. This is what the layer costs to page in, and it is a static property of the
-// file: nothing about decoding changes it, which is why the route trace states it once in the
-// static block instead of pretending to measure it per step.
-std::vector<uint64_t>
-dense_bytes_per_layer(const GgufOffsets & offs, const std::vector<LayerExperts> & layers, int n_layer) {
-    const std::unordered_set<std::string> streamed = expert_tensor_names(layers);
-    std::vector<uint64_t> out((size_t) std::max(0, n_layer), 0);
-    for (const auto & kv : offs.size_by_name) {
-        int il = -1;
-        if (std::sscanf(kv.first.c_str(), "blk.%d.", &il) != 1) continue;
-        if (il < 0 || il >= n_layer || streamed.count(kv.first)) continue;
-        out[(size_t) il] += kv.second;
-    }
-    return out;
-}
 
 } // namespace
 
@@ -256,8 +227,13 @@ struct Session::Impl {
     // the context and model are freed. The destructor does that explicitly.
     std::unique_ptr<llama_model, void (*)(llama_model *)> model{nullptr, llama_model_free};
     std::unique_ptr<llama_context, void (*)(llama_context *)> ctx{nullptr, llama_free};
-    std::unique_ptr<RouterHook> hook; // heap: its address is baked into cparams.cb_eval_user_data
-    ExpertStreamSource source;
+    // The streamer, and the two objects it owns. Session used to build these itself; the sequence
+    // is the same for any llama.cpp host, so it lives in ExpertStreamHost and this class is now
+    // one of its callers. hook/source are borrowed views, kept as the names the rest of the file
+    // already uses -- the host outlives every use of them.
+    std::unique_ptr<ExpertStreamHost> stream;
+    RouterHook * hook = nullptr;          // address baked into cparams.cb_eval_user_data
+    ExpertStreamSource * source = nullptr;
 
     // The MTP draft source (SpecConfig::source == mtp). A SECOND context over the SAME model,
     // created with ctx_type = MTP so llama.cpp builds the nextn graph instead of the trunk one. It
@@ -373,7 +349,7 @@ struct Session::Impl {
         // Deterministic teardown order: stop the I/O pool (it holds fds into the mmap and its
         // buffers back the rebound expert tensors), then the context (its eval callback points
         // at the hook), then the hook, then unmap the model, then release the backend.
-        source.shutdown();
+        if (source) source->shutdown();
         if (smpl) llama_sampler_free(smpl); // independent of ctx/model; free before them
         // The speculative driver holds both contexts and detaches the backend samplers it
         // installed on the draft one, so it goes before either context is freed.
@@ -381,7 +357,7 @@ struct Session::Impl {
         if (mtp_batch_owned) llama_batch_free(mtp_batch);
         ctx_dft.reset();
         ctx.reset();
-        hook.reset();
+        stream.reset(); // owns hook and source, so it goes exactly where the hook used to
         model.reset();
         if (backend_inited) llama_backend_free();
     }
@@ -410,7 +386,7 @@ bool Session::supports_tools() const {
     return impl_->tools_ok;
 }
 void Session::set_cache_budget_mb(int mib) {
-    impl_->source.set_cache_budget((size_t) std::max(0, mib) * 1024ull * 1024ull);
+    impl_->source->set_cache_budget((size_t) std::max(0, mib) * 1024ull * 1024ull);
 }
 void Session::cancel() {
     impl_->cancel_requested.store(true, std::memory_order_relaxed);
@@ -541,7 +517,10 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     // and the tensor naming identical, so this bound is the only thing standing between the streamer
     // and the MTP experts — left at n_layer they are silently skipped and stay mmap-resident.
     const int n_layer_streamed = im.n_layer + (cfg.spec.is_mtp() ? im.n_layer_nextn : 0);
-    im.hook = std::make_unique<RouterHook>(recipe ? *recipe : MoeRecipe{}, n_layer_streamed);
+    im.stream = std::make_unique<ExpertStreamHost>(cfg.moe, cfg.model_path);
+    im.stream->set_extra_layers(cfg.spec.is_mtp() ? im.n_layer_nextn : 0);
+    im.hook = &im.stream->hook();
+    im.source = &im.stream->source();
     im.hook->set_prefetch_layers(cfg.moe.prefetch_layers);
     im.hook->set_drop_policy(cfg.moe.drop_cold_frac, cfg.moe.drop_renorm, cfg.moe.drop_prefill);
     im.hook->set_predict_log(cfg.moe.predict_log);
@@ -567,7 +546,7 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     // mmap baseline the streamed numbers are argued against.
     if (cfg.moe.enabled || compute_trace) {
         cparams.cb_eval = &RouterHook::c_eval;
-        cparams.cb_eval_user_data = im.hook.get();
+        cparams.cb_eval_user_data = im.hook;
     }
     // Rejecting a draft means rewinding the KV to the last accepted position. With recurrent-state
     // snapshots the rewind is a cheap restore; without them llama.cpp has to fall back to replaying
@@ -637,7 +616,7 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
         ctx,
         [](void * ud) -> bool {
             auto * p = static_cast<Impl *>(ud);
-            return p->cancel_requested.load(std::memory_order_relaxed) || p->source.fatal();
+            return p->cancel_requested.load(std::memory_order_relaxed) || p->source->fatal();
         },
         &im);
 
@@ -671,88 +650,30 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     }
 
     if (cfg.moe.enabled) {
-        // Capture warm-up: one mmap-resident decode so the eval-callback can harvest the expert
-        // tensor pointers from the graph. Any valid token builds the same graph (the expert
-        // tensor structure is prompt-independent), so use BOS; KV is wiped afterwards.
-        im.hook->begin_capture();
-        llama_token warm_tok = llama_vocab_bos(im.vocab);
-        if (warm_tok < 0) warm_tok = 0;
+        // The whole sequence -- capture decode, harvest, gguf offsets, dense split, rebind -- is
+        // the same for any llama.cpp host, so it lives in ExpertStreamHost and this is one caller
+        // of it. Two things are ours to supply: the route trace wants per-layer dense totals, which
+        // can only be computed while the captured layers are still in hand; and MTP's expert layer
+        // is reached only through the draft context, so the capture decode has to be ours.
+        im.stream->want_dense_bytes(route_trace != nullptr);
         if (cfg.spec.is_mtp()) {
-            batch_fill(im.mtp_batch, &warm_tok, 1, /*pos0*/ 0, /*all_logits*/ true);
-            if (llama_decode(ctx, im.mtp_batch) != 0) return fail("capture warm-up decode failed");
-            // The MTP graph is built only by a decode on the draft context, and process() is what
-            // issues it. Without this pass the head's expert layer never reaches the eval callback,
-            // so it would stay unbound and silently mmap-resident — the one thing streaming exists
-            // to avoid on a model that does not fit.
-            if (!common_speculative_process(im.mtp.get(), im.mtp_batch))
-                return fail("MTP capture warm-up failed: the draft context could not process the batch");
-        } else {
-            llama_batch warm = llama_batch_get_one(&warm_tok, 1);
-            if (llama_decode(ctx, warm) != 0) return fail("capture warm-up decode failed");
-        }
-        im.hook->end_capture();
-
-        const GgufOffsets & offs = meta().offsets;
-        if (!offs.ok) return fail("cannot read gguf offsets: " + cfg.model_path);
-
-        std::vector<LayerExperts> layers = im.hook->captured();
-        int n_expert = 0;
-        int n_bound = 0;
-        for (LayerExperts & L : layers) {
-            if (!L.bound) continue;
-            ++n_bound;
-            for (int p = 0; p < MoeRecipe::max_exps; ++p) {
-                if (!recipe->exps_suffix[p]) continue; // slot unused by this architecture
-                ggml_tensor * t = L.proj[p].tensor;
-                if (!t)
-                    return fail(std::string("captured MoE layer is missing expert tensor '") + recipe->exps_suffix[p] +
-                                "'");
-                auto it = offs.off_by_name.find(t->name);
-                if (it == offs.off_by_name.end()) return fail(std::string("no gguf offset for tensor ") + t->name);
-                L.proj[p].file_off = it->second;
-                L.proj[p].file_idx = offs.file_by_name.at(t->name); // same parse as the offset, so present
-                const int ne2 = (int) t->ne[2];
-                if (n_expert == 0)
-                    n_expert = ne2;
-                else if (ne2 != n_expert)
-                    return fail(std::string("inconsistent expert count: tensor ") + t->name + " has " +
-                                std::to_string(ne2) + ", expected " + std::to_string(n_expert));
-            }
-        }
-        if (n_bound == 0) return fail("no MoE expert tensors captured — is this a MoE model?");
-
-        // Computed before init consumes `layers`: the dense split needs the captured expert
-        // tensor names and the gguf sizes together.
-        std::vector<uint64_t> dense_bytes;
-        if (route_trace) dense_bytes = dense_bytes_per_layer(offs, layers, n_layer_streamed);
-
-        // Anonymous dense-weights mode: hand the streamer the dense (non-expert) model weights to
-        // read into anon buffers. The list is every captured weight leaf that IS a gguf tensor
-        // (dropping graph inputs and KV, which share the leaf shape) and is NOT one of the streamed
-        // experts. Built before init consumes `layers`. Only this mode needs them; the others ignore
-        // an empty list.
-        if (cfg.moe.dense_weights == DenseWeightsMode::Anonymous || cfg.moe.dense_weights == DenseWeightsMode::Pinned) {
-            const std::unordered_set<std::string> expert_names = expert_tensor_names(layers);
-            std::vector<DenseTensorRef> dense;
-            for (const auto & kv : im.hook->captured_weights()) {
-                const std::string & name = kv.first;
-                if (expert_names.count(name)) continue;
-                auto off = offs.off_by_name.find(name);
-                auto sz = offs.size_by_name.find(name);
-                if (off == offs.off_by_name.end() || sz == offs.size_by_name.end()) continue; // not a file tensor
-                DenseTensorRef d;
-                d.tensor = kv.second;
-                d.file_off = off->second;
-                d.size = sz->second;
-                d.file_idx = offs.file_by_name.at(name);
-                dense.push_back(d);
-            }
-            im.source.set_dense_tensors(std::move(dense));
+            im.stream->set_capture([&im](llama_context * c) {
+                llama_token warm = llama_vocab_bos(im.vocab);
+                if (warm < 0) warm = 0;
+                batch_fill(im.mtp_batch, &warm, 1, /*pos0*/ 0, /*all_logits*/ true);
+                if (llama_decode(c, im.mtp_batch) != 0) return false;
+                // Without this pass the head's expert layer never reaches the eval callback, so it
+                // would stay unbound and silently mmap-resident -- the one thing streaming exists
+                // to avoid on a model that does not fit.
+                return common_speculative_process(im.mtp.get(), im.mtp_batch);
+            });
         }
 
-        if (!im.source.init(offs.shard_paths, n_expert, std::move(layers), cfg.moe))
-            return fail("expert stream source init failed");
-        im.hook->set_source(&im.source);
+        std::string serr;
+        if (!im.stream->attach(im.model.get(), ctx, serr)) return fail(serr);
+
+        const int n_expert = im.stream->n_expert();
+        std::vector<uint64_t> dense_bytes = im.stream->dense_bytes_per_layer();
 
         if (route_trace) {
             im.route_trace = route_trace;
@@ -774,18 +695,18 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
             st.dense_bytes_per_layer = std::move(dense_bytes);
             st.expert_bytes_per_layer.resize((size_t) n_layer_streamed);
             for (int il = 0; il < n_layer_streamed; ++il)
-                st.expert_bytes_per_layer[(size_t) il] = im.source.expert_bytes(il);
+                st.expert_bytes_per_layer[(size_t) il] = im.source->expert_bytes(il);
             route_trace->on_static(st);
         }
 
         if (io_trace) {
             im.io_trace = io_trace;
-            im.source.set_io_trace(true);
+            im.source->set_io_trace(true);
         }
 
         if (cfg.moe.overlap) {
 #ifdef BMOE_HAVE_EXPERT_READY_HOOK
-            im.source.enable_overlap_hook();
+            im.source->enable_overlap_hook();
 #else
             return fail("--overlap requires the bmoe llama.cpp fork (expert-ready hook not compiled in)");
 #endif
@@ -865,7 +786,7 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
                            : cfg.moe.dense_weights == DenseWeightsMode::Pinned    ? "ahwb"
                                                                                   : "warm";
         if (cfg.moe.enabled) {
-            const IExpertSource::Stats st = im.source.stats();
+            const IExpertSource::Stats st = im.source->stats();
             ri.cache_mb = (int) (st.cache_budget_bytes / (1024ull * 1024ull));
         }
         // The EFFECTIVE top-k: an override IS the applied width, otherwise the model's own. Same
@@ -1323,7 +1244,7 @@ RunResult Session::generate(const GenerateRequest & req,
         if (im.io_trace) {
             // The reads carry no frame of their own — a lane does not know which token it serves —
             // so stamp them with the decode they were drained after.
-            im.source.take_io_trace_rows(im.io_rows_scratch);
+            im.source->take_io_trace_rows(im.io_rows_scratch);
             for (IoTraceRow & r : im.io_rows_scratch) {
                 r.turn = im.turn;
                 r.phase = trace_phase;
@@ -1383,7 +1304,7 @@ RunResult Session::generate(const GenerateRequest & req,
                 res.cancelled = true;
                 return res;
             }
-            if (moe.overlap && im.source.fatal()) return fail("expert stream I/O failed during overlap prefill");
+            if (moe.overlap && im.source->fatal()) return fail("expert stream I/O failed during overlap prefill");
             return fail("prefill decode failed");
         }
         trace_flush();
@@ -1431,7 +1352,7 @@ RunResult Session::generate(const GenerateRequest & req,
     tally.overlap = moe.overlap;
     tally.n_threads = im.cfg.n_threads;
     if (moe.enabled) {
-        const IExpertSource::Stats st0 = im.source.stats();
+        const IExpertSource::Stats st0 = im.source->stats();
         tally.prev_bytes = (long long) st0.read_bytes;
         tally.prev_io_s = st0.read_seconds;
         tally.prev_mgmt_s = st0.mgmt_seconds;
@@ -1439,7 +1360,7 @@ RunResult Session::generate(const GenerateRequest & req,
         tally.prev_drain_s = st0.drain_wait_seconds;
         tally.prev_adopt_s = st0.adopt_wait_seconds;
     }
-    const IExpertSource::Stats st_spec0 = moe.enabled ? im.source.stats() : IExpertSource::Stats{};
+    const IExpertSource::Stats st_spec0 = moe.enabled ? im.source->stats() : IExpertSource::Stats{};
     long long prev_spec_bytes = (long long) st_spec0.spec_read_bytes;
     long long prev_spec_experts = st_spec0.spec_experts;
     long long prev_spec_useful = st_spec0.spec_useful;
@@ -1495,7 +1416,7 @@ RunResult Session::generate(const GenerateRequest & req,
         const int room = req.n_predict - n_gen - 1; // tokens still wanted after `tok` itself
         if (spec_on && room > 0) {
             const auto d0 = clock_t_::now();
-            const uint64_t db0 = moe.enabled ? im.source.stats().read_bytes : 0;
+            const uint64_t db0 = moe.enabled ? im.source->stats().read_bytes : 0;
             im.draft_buf.clear();
             if (mtp_on) {
                 common_speculative_draft_params & dp = common_speculative_get_draft_params(im.mtp.get(), /*seq*/ 0);
@@ -1528,7 +1449,7 @@ RunResult Session::generate(const GenerateRequest & req,
             im.mtp_drafted += n_draft;
             if (n_draft > 0) ++im.drafted_steps;
             draft_s += secs(d0, clock_t_::now());
-            if (moe.enabled) im.mtp_draft_read_bytes += im.source.stats().read_bytes - db0;
+            if (moe.enabled) im.mtp_draft_read_bytes += im.source->stats().read_bytes - db0;
         }
 
         // ── verify batch: the confirmed token, then every draft, all asking for logits ──
@@ -1572,7 +1493,7 @@ RunResult Session::generate(const GenerateRequest & req,
                 res.cancelled = true;
                 break;
             }
-            if (moe.overlap && im.source.fatal()) return fail("expert stream I/O failed during overlap decode");
+            if (moe.overlap && im.source->fatal()) return fail("expert stream I/O failed during overlap decode");
             return fail("decode failed during generation");
         }
         trace_flush(); // outside the s0..s1 bracket: the trace's own writes must not bill wall_ms
@@ -1620,12 +1541,12 @@ RunResult Session::generate(const GenerateRequest & req,
             // history the emit block appends to, which is already correct by the time it is read.
             if (mtp_on) {
                 const auto p0 = clock_t_::now();
-                const uint64_t pb0 = moe.enabled ? im.source.stats().read_bytes : 0;
+                const uint64_t pb0 = moe.enabled ? im.source->stats().read_bytes : 0;
                 batch_fill(im.mtp_batch, verify_toks.data(), 1 + n_acc, n_past, /*all_logits*/ false);
                 if (!common_speculative_process(im.mtp.get(), im.mtp_batch))
                     return fail("MTP draft context failed to process the verify batch");
                 draft_s += secs(p0, clock_t_::now());
-                if (moe.enabled) im.mtp_draft_read_bytes += im.source.stats().read_bytes - pb0;
+                if (moe.enabled) im.mtp_draft_read_bytes += im.source->stats().read_bytes - pb0;
             }
             im.mtp_draft_seconds += draft_s;
 
@@ -1646,7 +1567,7 @@ RunResult Session::generate(const GenerateRequest & req,
         // evenly would read as several equally-cheap tokens, which is not what happened.
         const double wall = secs(s0, s1);
         gen_seconds += wall;
-        const IExpertSource::Stats st = moe.enabled ? im.source.stats() : IExpertSource::Stats{};
+        const IExpertSource::Stats st = moe.enabled ? im.source->stats() : IExpertSource::Stats{};
         // Route-ahead's eval-thread meters accumulate per DECODE, and one decode can confirm a whole
         // group, so they are read once here and charged to the group's first row like every other
         // group cost. Reading them inside the loop would advance the cursors once per token and
@@ -1754,7 +1675,7 @@ RunResult Session::generate(const GenerateRequest & req,
     s.majflt_per_token = n_gen ? (double) tally.majflt / n_gen : 0.0;
     s.cpu_s_per_token = n_gen ? tally.cpu_seconds / n_gen : 0.0;
     if (moe.enabled) {
-        IExpertSource::Stats st = im.source.stats();
+        IExpertSource::Stats st = im.source->stats();
         s.moe_read_mib = tally.read_bytes / (1024.0 * 1024.0);
         s.moe_io_seconds = tally.io_seconds;
         s.moe_io_s_per_token = n_gen ? tally.io_seconds / n_gen : 0.0;

@@ -122,6 +122,7 @@ bool DenseWeights::read_anonymous(size_t align) {
         d.tensor->data = buf; // rebind the model weight onto its private copy
         total += d.size;
     }
+    rebound_bytes_ = total;
     std::fprintf(stderr, "bmoe: dense-weights=%s — %llu MiB in %zu %s buffers\n", pinned ? "ahwb" : "anon",
                  (unsigned long long) (total >> 20), buf_sz_.size(), pinned ? "pinned" : "anon");
     return true;

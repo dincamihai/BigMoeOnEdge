@@ -7,6 +7,15 @@ Semantic Versioning.
 ## [Unreleased]
 
 ### Added
+- **Session now uses that seam instead of its own copy of it.** The capture decode, the harvest,
+  the gguf offsets, the dense split and the rebind lived inline in `Session::open`; they are now one
+  call to `ExpertStreamHost`, and the two things that genuinely belong to this caller are passed in
+  — the per-layer dense totals the route trace wants, and the MTP capture decode, since that head's
+  expert layer is only reached through the draft context. `session.cpp` is 79 lines shorter and the
+  harvest exists once. The move also found a real defect the seam had been hiding: `RouterHook`
+  sizes per-layer state in three setters as well as in its constructor, so a host that configures
+  the router before the architecture is known left those vectors empty and the first real decode
+  indexed past the end. `set_recipe()` now re-runs them.
 - **Expert streaming can be attached by a host that is not this project.** `bmoe::ExpertStreamHost`
   is the seam stated as an API: a llama.cpp host fills in the model parameters the rebind requires,
   installs the router hook as the context's eval callback, and calls `attach()` once the context

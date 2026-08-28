@@ -21,6 +21,7 @@
 #include <vector>
 
 static int failures = 0;
+static int g_last_n_expert = 0;
 
 static void expect(const char * name, bool ok, const std::string & detail = {}) {
     if (ok) {
@@ -32,9 +33,12 @@ static void expect(const char * name, bool ok, const std::string & detail = {}) 
 }
 
 // One greedy continuation of a fixed prompt. `host` is null for the resident baseline.
-static std::vector<llama_token> run(const char * model_path, bool streamed, int n_gen, std::string & err) {
+static std::vector<llama_token> run(const char * model_path, bool streamed, int n_gen, std::string & err,
+                                   bmoe::DenseWeightsMode dense = bmoe::DenseWeightsMode::Mmap,
+                                   uint64_t * dense_bytes = nullptr) {
     bmoe::MoeStreamConfig moe;
     moe.enabled = streamed;
+    moe.dense_weights = dense;
 
     bmoe::ExpertStreamHost host(moe, model_path);
 
@@ -57,6 +61,9 @@ static std::vector<llama_token> run(const char * model_path, bool streamed, int 
         llama_model_free(model);
         return {};
     }
+
+    if (dense_bytes) *dense_bytes = host.dense_rebound_bytes();
+    if (streamed) g_last_n_expert = host.n_expert();
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
     llama_token tok = llama_vocab_bos(vocab);
@@ -100,6 +107,27 @@ int main(int argc, char ** argv) {
            !resident.empty() && streamed == resident,
            "resident " + std::to_string(resident.size()) + " tokens, streamed " +
                std::to_string(streamed.size()));
+
+    // The dense-weights policy is what let a 158 GB model run on a 123 GB box: the experts stream,
+    // and the dense side is read into private buffers instead of being left to the page cache. A
+    // host that forgets to hand those tensors over gets a streamer that SILENTLY stays on mmap --
+    // same answers, none of the memory behaviour -- so what is asserted is the rebind itself, not
+    // the tokens.
+    uint64_t rebound = 0;
+    std::string err_anon;
+    const std::vector<llama_token> anon =
+        run(argv[1], /*streamed*/ true, 8, err_anon, bmoe::DenseWeightsMode::Anonymous, &rebound);
+
+    // What the harvest concluded, not what the caller assumed. A wrong expert count does not fail
+    // loudly -- it makes the streamer slice the tensor on the wrong stride -- so the number the
+    // capture arrived at is worth stating out loud and pinning.
+    expect("the host reports the expert count it discovered", g_last_n_expert == 8,
+           "n_expert " + std::to_string(g_last_n_expert));
+
+    expect("the anonymous dense policy rebinds dense weights off mmap", rebound > 0,
+           "rebound " + std::to_string(rebound) + " bytes");
+    expect("rebinding the dense weights does not change the answer",
+           !resident.empty() && anon == resident, err_anon);
 
     llama_backend_free();
     std::printf("\nhost attach: %s\n", failures == 0 ? "all checks passed" : "FAILED");
