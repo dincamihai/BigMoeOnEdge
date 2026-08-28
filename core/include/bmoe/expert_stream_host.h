@@ -19,6 +19,8 @@
 
 #include "bmoe/config.h"
 
+#include "ggml-backend.h"
+
 #include <functional>
 #include <vector>
 
@@ -49,6 +51,13 @@ public:
     // The layout the rebind requires: file-backed mmap, no extra buffer types (a repacked q4_K
     // buffer cannot be rebound), and no GPU offload (the rebind targets host memory).
     void configure(llama_model_params & mparams) const;
+
+    // The eval callback and its user data, for a host that does not fill a llama_context_params
+    // itself. llama.cpp's server builds both params structs inside common_init_from_params from a
+    // common_params, so it needs the pair rather than the convenience above; they are the same
+    // two values.
+    ggml_backend_sched_eval_callback eval_callback() const;
+    void * eval_user_data();
 
     // Installs the router hook as the context's eval callback. The host must not overwrite
     // cb_eval afterwards; there is one callback slot and the streamer needs it.

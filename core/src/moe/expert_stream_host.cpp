@@ -84,6 +84,14 @@ void ExpertStreamHost::configure(llama_model_params & mparams) const {
     mparams.n_gpu_layers    = 0;
 }
 
+ggml_backend_sched_eval_callback ExpertStreamHost::eval_callback() const {
+    return &RouterHook::c_eval;
+}
+
+void * ExpertStreamHost::eval_user_data() {
+    return &hook(); // creates the hook if the caller has not touched it yet
+}
+
 void ExpertStreamHost::configure(llama_context_params & cparams) {
     if (!impl_->cfg.enabled) return;
     // The hook has to exist before the context does, because its address is what the context

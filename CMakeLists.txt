@@ -45,16 +45,37 @@ option(BMOE_BUILD_TOOLS "Build standalone diagnostic tools (bmoe-iobench)" OFF)
 set(BMOE_HAVE_LLAMA OFF)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/CMakeLists.txt")
     set(BMOE_HAVE_LLAMA ON)
-    # Upstream examples/tests/server stay off; build the common utils we link for chat.
+    # Upstream examples/tests stay off; build the common utils we link for chat.
+    #
+    # The server is optional and off by default. Turned on, upstream's own server is built and the
+    # streamer is attached to it -- the experiment behind BMOE_LLAMA_SERVER: everything this project
+    # has that llama.cpp does not is the streamer, and everything llama.cpp has that this project
+    # reimplements badly is the rest of a server. llama.cpp is add_subdirectory'd here, so its
+    # targets and bmoe_core sit in one CMake project and the link needs no inverted dependency.
+    option(BMOE_LLAMA_SERVER "build upstream llama-server with expert streaming attached" OFF)
     set(LLAMA_BUILD_TESTS   OFF CACHE BOOL "" FORCE)
     set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-    set(LLAMA_BUILD_SERVER  OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_SERVER  ${BMOE_LLAMA_SERVER} CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_TOOLS   ${BMOE_LLAMA_SERVER} CACHE BOOL "" FORCE) # the server lives under tools/
     set(LLAMA_BUILD_COMMON  ON  CACHE BOOL "" FORCE)
     set(LLAMA_CURL          OFF CACHE BOOL "" FORCE)  # common's model-download path unused
     add_subdirectory(third_party/llama.cpp EXCLUDE_FROM_ALL)
 endif()
 
 add_subdirectory(core)
+
+if(BMOE_HAVE_LLAMA AND BMOE_LLAMA_SERVER AND TARGET server-context)
+    # The whole patch on the llama.cpp side is guarded by this definition, so a server built
+    # without it is byte-for-byte upstream's. It goes on `server-context`, not on the executable:
+    # that is the library holding load_model, and the executable is a thin main().
+    # The server's implementation is a shared library, so the static core has to be relocatable.
+    set_target_properties(bmoe_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_link_libraries(server-context PUBLIC bmoe_core)
+    target_compile_definitions(server-context PRIVATE BMOE_STREAM_IN_SERVER=1)
+    if(TARGET llama-server)
+        set_target_properties(llama-server PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    endif()
+endif()
 
 if(BMOE_BUILD_CLI AND BMOE_HAVE_LLAMA)
     add_subdirectory(cli)
