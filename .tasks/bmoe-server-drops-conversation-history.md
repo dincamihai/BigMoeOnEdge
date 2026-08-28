@@ -11,6 +11,25 @@ to PORT `cli/server_main.cpp` onto `main`, whose engine takes `messages_json` an
 Dropped in the port, because main's core has no field for them: `--mmproj` and the image
 extraction that fed it (main is text-only), and `--batch-size` (main has n_ubatch, not n_batch).
 
+REVISITED 2026-08-28, and both dropped items were looked at again with the branch still open.
+Neither decision reversed the flattening fix: what pr-161 keeps that main must never take back is
+`extract_last_user_message` and the ~190 lines around it. Any future pass over that branch takes
+named changes onto main's server, never the file.
+
+  - `--batch-size` is now IN (01bb7f2). The reason it was dropped was the missing field, not the
+    knob, so the field was added -- and the more valuable half turned out to be the DEFAULT it
+    changes. main had `sc.n_batch = cfg.n_ctx` ("one-batch prefill for any prompt that fits the
+    context") with n_ubatch following it, so opening a session at a large context reserved compute
+    buffers for a full-width prefill graph before decoding a token; that reservation is resident
+    and comes out of the expert cache. Both now default to 512 and are set independently, in
+    runtime.cpp so bmoe-cli gets them too. Authorship of the original change preserved.
+  - `--mmproj` STAYS OUT, and the reason is stronger than "main is text-only": it does nothing on
+    pr-161 either. Its engine side loads the projector and then, in generate(), prints
+    `bmoe: vision input: %zu image(s) provided (MTMD integration pending)` and drops them -- no
+    decode, no embeddings, nothing prepended, while session.h's comment claims the opposite. The
+    cost of taking it would be LLAMA_BUILD_MTMD=ON on every build, mtmd linked into bmoe_core, and
+    two public API fields that are silent. Revisit only if the MTMD integration is actually written.
+
 A second defect surfaced during acceptance and is fixed in 94527d8: a request carrying `tools`
 returned 200 with content "", tool_calls null, finish_reason "stop". The engine had the call in
 `RunResult::tool_calls_json` (runtime.h:37) all along and neither response path read it.
@@ -38,7 +57,7 @@ STILL OPEN, left as follow-ups rather than reopening this card:
 
 column: Done
 closed: 2026-08-19
-fixed-by: 8dadae6 (merged d830872), 94527d8
+fixed-by: 8dadae6 (merged d830872), 94527d8; follow-up 01bb7f2
 created: 2026-08-19
 branch: pr-161
 
