@@ -90,6 +90,26 @@ ships an equivalent per-expert readiness/residency callback, the branch is dropp
 submodule bumps straight back to `ggml-org/llama.cpp`. It is a tide-me-over until the wait
 point is public, not a divergence we intend to maintain.
 
+**Building against an architecture the pin does not carry.** The hook branch sits on top of
+upstream's pin, so it has whatever architectures that pin has — and a model whose support
+lives on someone else's branch cannot be loaded by bumping the submodule. The hook is
+independent of any architecture, so the fix is to apply it to *that* branch rather than to
+port the architecture here. Qwen3.8-Flash-Next is the worked example: its `qwen4exp` support
+(with the hybrid memory its indexer cache needs) lives on `qwen4exp/qwen3.8-flash-next` at
+`unslothai/llama.cpp`, and the base BigMoeOnEdge was built against is that branch with the
+one hook commit cherry-picked on top:
+
+```sh
+git checkout -b bmoe/qwen4exp-expert-hook <unsloth-remote>/qwen4exp/qwen3.8-flash-next
+git cherry-pick <helldez-remote>/bmoe/expert-ready-hook   # the single hook commit
+```
+
+The result is kept on the `bmoe/qwen4exp-expert-hook` branch of a personal llama.cpp fork.
+Note what does NOT change: the hook is opt-in and detected at configure time, so a base
+without it still builds and still streams — it only loses the I/O–compute overlap. Nothing
+about the architecture reaches the streaming seam; `qwen4exp` needs one recipe row in
+`arch_registry.cpp` and nothing else.
+
 ## The chat glue: llama.cpp `common` (not the streaming seam)
 
 Separate from the two streaming hooks above, `session.cpp` links llama.cpp's `common`
