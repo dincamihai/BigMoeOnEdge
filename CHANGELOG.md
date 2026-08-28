@@ -20,6 +20,14 @@ Semantic Versioning.
   llama.cpp's own `common_json`.
 
 ### Fixed
+- **A long-context session no longer reserves a graph as wide as its window.** `n_batch` followed
+  `n_ctx` — "one-batch prefill for any prompt that fits the context" — and `n_ubatch` followed
+  `n_batch`, so opening a session at a large context reserved compute buffers for a full-width
+  prefill before a single token was decoded. That reservation is resident, and on this engine every
+  MiB of it is a MiB the expert cache and the dense weights do not get. Both now default to 512 and
+  are set independently, `--batch-size` alongside the existing `--ubatch`. Prefill of a long prompt
+  costs more passes; nothing about decode changes, since a decode graph is one token wide either
+  way.
 - **A spliced history no longer costs the next turn its whole prefix.** `kv_tokens` served two
   masters: at commit time it mirrored the canonical sequence, but the splice rewrote it to describe
   the working sequence it had just rewound. On the plain path the two agree, so this was invisible;

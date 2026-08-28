@@ -11,8 +11,11 @@ SessionConfig session_config_from(const RunConfig & cfg) {
     sc.model_path = cfg.model_path;
     sc.n_threads = cfg.n_threads;
     sc.n_ctx = cfg.n_ctx;
-    sc.n_batch = cfg.n_ctx;     // one-batch prefill for any prompt that fits the context
-    sc.n_ubatch = cfg.n_ubatch; // 0 = follow n_batch; smaller trades prefill speed for memory
+    // Neither follows n_ctx any more: a graph reserved as wide as the whole window is the single
+    // largest resident allocation a long-context session makes, and it is made before a token is
+    // decoded. 512 for both, overridable, trades prefill throughput for that memory.
+    sc.n_batch = cfg.n_batch > 0 ? cfg.n_batch : 512;
+    sc.n_ubatch = cfg.n_ubatch > 0 ? cfg.n_ubatch : 512;
     sc.chatml = cfg.chatml;
     sc.n_expert_used = cfg.n_expert_used; // active-expert (top-k) override; 0 = model default
     sc.compute_trace_layers = cfg.compute_trace_layers;

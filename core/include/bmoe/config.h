@@ -308,20 +308,20 @@ struct RunConfig {
     int n_threads = 4;
     int n_ctx = 2048;
 
-    // Largest batch computed in one graph, i.e. the prefill chunk size. 0 (the default) means
-    // "follow n_ctx", which prefills any fitting prompt in a single pass.
+    // How much of a prompt is submitted at once, and how wide the graph that computes it may be.
+    // Both default to 512 when left at 0.
     //
-    // It is worth exposing because it does not only cost time, it costs RESIDENT MEMORY: the
-    // scheduler reserves compute buffers for the worst-case graph, which is a full-width prefill,
-    // and on this engine every MiB reserved is a MiB the expert cache and the dense weights do not
-    // get. Measured at n_ctx 2048: 320 MiB of compute buffer, falling to 80 MiB at 512 — the
-    // reservation scales with the context, which is exactly the coupling this knob breaks. It was
-    // found while chasing a fault storm that turned out to be the reservation itself, not the
-    // workload.
+    // They are worth exposing because they do not only cost time, they cost RESIDENT MEMORY: the
+    // scheduler reserves compute buffers for the worst-case graph, and on this engine every MiB
+    // reserved is a MiB the expert cache and the dense weights do not get. Measured at n_ctx 2048:
+    // 320 MiB of compute buffer, falling to 80 MiB at 512. The reservation scales with the WIDTH,
+    // which is why neither may quietly follow the context: n_batch used to default to n_ctx, so a
+    // long-context session reserved a graph as wide as its whole window before decoding a token.
     //
-    // Decode is unaffected: a decode graph is one token wide whatever this says. The cost is
+    // Decode is unaffected: a decode graph is one token wide whatever these say. The cost is
     // prefill throughput, which processes a long prompt in more, smaller passes.
-    int n_ubatch = 0;
+    int n_batch = 0;  // tokens submitted per prefill pass; 0 = 512
+    int n_ubatch = 0; // widest graph computed in one go; 0 = 512, and never wider than n_batch
     bool chatml = false;   // wrap the prompt in the model family's chat turn (arch-aware)
     bool progress = false; // emit machine telemetry (one JSON line per token)
 
