@@ -196,6 +196,19 @@ bool ExpertStreamHost::attach(llama_model * model, llama_context * ctx, std::str
         return false;
     }
     impl_->hook->set_source(&impl_->source);
+
+    // Overlap is the one capability that needs the fork's 28-line hook. Refusing loudly rather
+    // than running without it is the point: the answers are identical either way, so a silent
+    // fallback would hide the whole reason the flag was passed.
+    if (impl_->cfg.overlap) {
+#ifdef BMOE_HAVE_EXPERT_READY_HOOK
+        impl_->source.enable_overlap_hook();
+#else
+        err = "overlap requires the expert-ready hook, which this llama.cpp build does not carry";
+        return false;
+#endif
+    }
+
     impl_->attached = true;
     return true;
 }
@@ -216,6 +229,10 @@ int ExpertStreamHost::n_expert() const { return impl_->n_expert; }
 int ExpertStreamHost::n_layer_streamed() const { return impl_->n_layer_streamed; }
 const std::vector<uint64_t> & ExpertStreamHost::dense_bytes_per_layer() const { return impl_->dense_bytes; }
 const GgufMeta & ExpertStreamHost::meta() const { return impl_->meta; }
+
+bool ExpertStreamHost::overlap_enabled() const {
+    return impl_->attached && impl_->source.overlap_enabled();
+}
 
 uint64_t ExpertStreamHost::dense_rebound_bytes() const {
     return impl_->attached ? impl_->source.dense_rebound_bytes() : 0;

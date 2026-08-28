@@ -96,6 +96,10 @@ public:
     // Bytes the dense-weights policy read into private buffers and rebound (0 for mmap policies).
     uint64_t dense_rebound_bytes() const { return dense_.rebound_bytes(); }
 
+    // Whether the expert-ready hook is armed, i.e. whether reads overlap compute. False when the
+    // fork hook is not compiled in, which is why asking is not the same as having asked.
+    bool overlap_enabled() const { return overlap_; }
+
     // Explicitly set the cache budget in bytes and evict down to it immediately (clamped to the
     // full expert-set size). PRECONDITION: no decode in flight — the caller must not be inside a
     // load_layer/generate. Intended for an app's memory-pressure callback (Android onTrimMemory)

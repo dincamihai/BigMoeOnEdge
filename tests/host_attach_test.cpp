@@ -22,6 +22,7 @@
 
 static int failures = 0;
 static int g_last_n_expert = 0;
+static bool g_last_overlap = false;
 
 static void expect(const char * name, bool ok, const std::string & detail = {}) {
     if (ok) {
@@ -35,10 +36,11 @@ static void expect(const char * name, bool ok, const std::string & detail = {}) 
 // One greedy continuation of a fixed prompt. `host` is null for the resident baseline.
 static std::vector<llama_token> run(const char * model_path, bool streamed, int n_gen, std::string & err,
                                    bmoe::DenseWeightsMode dense = bmoe::DenseWeightsMode::Mmap,
-                                   uint64_t * dense_bytes = nullptr) {
+                                   uint64_t * dense_bytes = nullptr, bool overlap = false) {
     bmoe::MoeStreamConfig moe;
     moe.enabled = streamed;
     moe.dense_weights = dense;
+    moe.overlap = overlap;
 
     bmoe::ExpertStreamHost host(moe, model_path);
 
@@ -63,7 +65,10 @@ static std::vector<llama_token> run(const char * model_path, bool streamed, int 
     }
 
     if (dense_bytes) *dense_bytes = host.dense_rebound_bytes();
-    if (streamed) g_last_n_expert = host.n_expert();
+    if (streamed) {
+        g_last_n_expert = host.n_expert();
+        g_last_overlap  = host.overlap_enabled();
+    }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
     llama_token tok = llama_vocab_bos(vocab);
@@ -128,6 +133,18 @@ int main(int argc, char ** argv) {
            "rebound " + std::to_string(rebound) + " bytes");
     expect("rebinding the dense weights does not change the answer",
            !resident.empty() && anon == resident, err_anon);
+
+    // The expert-ready hook is the one thing this project asks of llama.cpp that is not already
+    // public API, and it is opt-in at build time. A host that asks for the overlap it buys must
+    // either get it or be told, because the failure is invisible: the answers are identical and
+    // only the I/O stops overlapping with compute.
+    std::string err_ov;
+    const std::vector<llama_token> overlapped =
+        run(argv[1], /*streamed*/ true, 8, err_ov, bmoe::DenseWeightsMode::Mmap, nullptr, /*overlap*/ true);
+
+    expect("asking for overlap turns it on rather than silently dropping it", g_last_overlap, err_ov);
+    expect("overlapping the reads does not change the answer",
+           !resident.empty() && overlapped == resident, err_ov);
 
     llama_backend_free();
     std::printf("\nhost attach: %s\n", failures == 0 ? "all checks passed" : "FAILED");

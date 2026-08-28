@@ -7,6 +7,13 @@ Semantic Versioning.
 ## [Unreleased]
 
 ### Added
+- **Asking for overlap now fails loudly on a build without the hook.** The expert-ready hook is
+  the one thing this project asks of llama.cpp that is not already public API, and it is opt-in at
+  compile time. Deciding on it moved into `ExpertStreamHost` with the rest of the arming sequence,
+  and a host can now ask whether reads actually overlap compute rather than assuming the flag took.
+  The failure it guards against is invisible by construction: with or without the hook the answers
+  are identical and only the I/O stops overlapping, so a silent fallback would hide the whole
+  reason the flag was passed.
 - **Session now uses that seam instead of its own copy of it.** The capture decode, the harvest,
   the gguf offsets, the dense split and the rebind lived inline in `Session::open`; they are now one
   call to `ExpertStreamHost`, and the two things that genuinely belong to this caller are passed in

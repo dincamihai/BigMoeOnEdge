@@ -91,6 +91,11 @@ public:
     // False until attach() has succeeded.
     bool attached() const;
 
+    // Whether reads overlap compute, i.e. whether the fork's expert-ready hook is armed. Asking
+    // for overlap on a build without the hook fails the attach rather than running slower in
+    // silence, so this is false only before attach().
+    bool overlap_enabled() const;
+
     // Bytes the dense-weights policy read into private buffers and rebound. Zero under the mmap
     // policies, and zero before attach(). A host can check this to tell a policy that ran from one
     // that silently degraded to mmap because nothing handed it the tensors.
