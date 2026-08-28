@@ -56,6 +56,12 @@ public:
     // Install as ctx_params.cb_eval / cb_eval_user_data before context creation.
     static bool c_eval(ggml_tensor * t, bool ask, void * user_data);
 
+    // Settle the architecture AFTER construction. A host that installs cb_eval through a params
+    // struct -- llama.cpp's own server does, since it builds model and context in one call -- has
+    // to hand out this object's address before any model exists to be asked its architecture.
+    // Callable only before the first capture; the recipe decides what capture records.
+    void set_recipe(const MoeRecipe & recipe, int n_layer);
+
     void begin_capture(); // switch to capture; clears prior records
     void end_capture();   // stop recording (called after the warm-up decode)
 

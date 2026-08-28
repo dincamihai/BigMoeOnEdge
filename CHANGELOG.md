@@ -7,6 +7,16 @@ Semantic Versioning.
 ## [Unreleased]
 
 ### Added
+- **Expert streaming can be attached by a host that is not this project.** `bmoe::ExpertStreamHost`
+  is the seam stated as an API: a llama.cpp host fills in the model parameters the rebind requires,
+  installs the router hook as the context's eval callback, and calls `attach()` once the context
+  exists. Two phases rather than one because the streamer learns which tensors are expert weights by
+  watching a real graph go past the callback, so it cannot be armed before there is something to
+  decode with. `RouterHook` gained `set_recipe()` for the same reason: a host that installs
+  `cb_eval` through a params struct — llama.cpp's own server does, since it builds model and
+  context in one call — has to hand out the hook's address before any model exists to be asked its
+  architecture. Pinned by a test that runs a plain llama.cpp decode loop twice, once resident and
+  once streamed, and requires the same tokens out of both.
 - **Qwen3.8-Flash-Next (`qwen4exp`) streams.** The arch is a hybrid stack carrying more dense-side
   machinery than any other in the registry — a per-layer indexer, a hypernetwork-style injection
   path and PLE tensors — but none of it touches the streaming seam: it is resident dense weight on

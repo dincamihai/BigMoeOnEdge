@@ -91,3 +91,12 @@ if(PYTHON3)
 else()
     message(WARNING "python3 not found: MoE gates will not run (models cannot be generated)")
 endif()
+
+# The seam that lets the streamer live without this project's chat layer: a plain llama.cpp host
+# attaches expert streaming and must get byte-identical tokens. Needs a model, so it is gated the
+# same way the MoE gates are.
+add_executable(bmoe_host_attach_test host_attach_test.cpp)
+target_link_libraries(bmoe_host_attach_test PRIVATE bmoe_core)
+add_test(NAME host_attach_qwen3moe
+         COMMAND bmoe_host_attach_test ${CMAKE_CURRENT_BINARY_DIR}/tiny-moe-qwen3moe.gguf)
+set_tests_properties(host_attach_qwen3moe PROPERTIES DEPENDS moe_make_tiny_model_qwen3moe)

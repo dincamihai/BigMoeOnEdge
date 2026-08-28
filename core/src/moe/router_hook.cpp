@@ -134,6 +134,16 @@ static int32_t * id_at(ggml_tensor * t, int j, int k) {
     return (int32_t *) ((char *) t->data + (size_t) j * t->nb[1] + (size_t) k * t->nb[0]);
 }
 
+void RouterHook::set_recipe(const MoeRecipe & recipe, int n_layer) {
+    // Same work the constructor does, so the two entry points cannot drift: a host that could not
+    // know the architecture yet ends up in exactly the state one that could would have been in.
+    recipe_  = recipe;
+    n_layer_ = n_layer;
+    const int n = n_layer_ > 0 ? n_layer_ : 0;
+    captured_.assign(n, LayerExperts{});
+    prev_ids_.assign(n, std::vector<int32_t>{});
+}
+
 void RouterHook::begin_capture() {
     capturing_ = true;
     for (auto & L : captured_)
